@@ -216,17 +216,20 @@ impl Play {
         }
 
         let mut next = None;
+        // 下部パネルを先に置いて全幅を確保し、狭い画面でもロール操作が隠れないようにする
+        let width = ui.available_width();
+        egui::Panel::bottom("ctrl")
+            .exact_size(190.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, now));
+            });
         egui::Panel::right("side")
-            .default_size(340.0)
+            .default_size(340.0_f32.min(width * 0.45))
+            .max_size(width * 0.6)
             .show(ui, |ui| {
                 if self.side(ui) {
                     next = Some(Screen::Title);
                 }
-            });
-        egui::Panel::bottom("ctrl")
-            .exact_size(190.0)
-            .show(ui, |ui| {
-                self.controls(ui, now);
             });
         egui::CentralPanel::default().show(ui, |ui| self.board(ui, now));
 
@@ -642,7 +645,10 @@ impl Play {
                     ui.label("— CPU が考え中…");
                 }
             }
-            if let Some(roll) = g.last_roll() {
+            // ロール前は前手番の出目を出さない
+            if !matches!(phase, Phase::Roll)
+                && let Some(roll) = g.last_roll()
+            {
                 ui.label("出目:");
                 for d in roll {
                     ui.label(
