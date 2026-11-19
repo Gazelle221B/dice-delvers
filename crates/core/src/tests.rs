@@ -529,3 +529,26 @@ fn cpu_mirror_matches_only_make_legal_moves_and_finish() {
         assert!(game.turn() <= 300);
     }
 }
+
+#[test]
+fn mirror_rosters_preserve_seat_ids_and_use_faction_abilities() {
+    for faction in [Faction::Ember, Faction::Frost] {
+        let mut game = Game::with_factions(1, [faction; 2]);
+        for player in [P1, P2] {
+            game.turn_player = player;
+            for level in 1..=3 {
+                game.summon(level, (usize::from(level), player.index()));
+                let (id, definition) = game.monster(player, level).unwrap();
+                assert_eq!(id, player.index() * 3 + usize::from(level - 1));
+                let unit = game.unit(id).unwrap();
+                assert_eq!(
+                    unit.ability,
+                    MONSTERS[faction as usize * 3 + usize::from(level - 1)].5
+                );
+                assert_eq!(unit.name, definition.0);
+                assert_eq!(game.combatant_name(Creature(id)), unit.name);
+            }
+        }
+        assert_eq!(game.units().len(), 6);
+    }
+}
