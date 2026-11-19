@@ -171,3 +171,23 @@ impl Game {
         reachable
     }
 }
+
+impl Game {
+    /// 両ドメイン間に上下左右のタイル経路があるか。所有者と占有ユニットは問わない。
+    pub fn domains_connected(&self) -> bool {
+        let mut stack = vec![Player::P1.domain()];
+        let mut seen = [[false; W]; H];
+        while let Some(pos) = stack.pop() {
+            for (x, y) in neighbors(pos) {
+                if (x, y) == Player::P2.domain() {
+                    return true;
+                }
+                if !seen[y][x] && matches!(self.board[y][x], Cell::Tile(_)) {
+                    seen[y][x] = true;
+                    stack.push((x, y));
+                }
+            }
+        }
+        false
+    }
+}

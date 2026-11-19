@@ -398,6 +398,7 @@ fn warden_hit_is_immediate_and_zero_lp_ends_game() {
     })
     .unwrap();
     assert_eq!(game.lp(P2), 0);
+    assert_eq!(game.end_reason(), Some(EndReason::LpZero));
     assert_eq!(game.runes(P2).guard, 1);
     assert_eq!(game.outcome(), Some(Outcome::Win(P1)));
     assert_eq!(game.to_act(), None);
@@ -484,6 +485,7 @@ fn last_defeat_can_trigger_stalemate() {
     }
     blocked.apply(Action::EndTurn).unwrap();
     assert_eq!(blocked.outcome(), Some(Outcome::Draw));
+    assert_eq!(blocked.end_reason(), Some(EndReason::Stalemate));
 }
 
 #[test]
@@ -501,6 +503,7 @@ fn turn_limit_uses_lp_then_count_then_level_sum() {
         game.turn = 300;
         game.apply(Action::EndTurn).unwrap();
         assert_eq!(game.turn(), 300);
+        assert_eq!(game.end_reason(), Some(EndReason::TurnLimit));
         assert_eq!(game.outcome(), Some(outcome));
     }
 }
@@ -528,4 +531,179 @@ fn cpu_mirror_matches_only_make_legal_moves_and_finish() {
         );
         assert!(game.turn() <= 300);
     }
+}
+
+#[test]
+fn mirror_rosters_preserve_seat_ids_and_use_faction_abilities() {
+    for faction in [Faction::Ember, Faction::Frost] {
+        let mut game = Game::with_factions(1, [faction; 2]);
+        for player in [P1, P2] {
+            game.turn_player = player;
+            for level in 1..=3 {
+                game.summon(level, (usize::from(level), player.index()));
+                let (id, definition) = game.monster(player, level).unwrap();
+                assert_eq!(id, player.index() * 3 + usize::from(level - 1));
+                let unit = game.unit(id).unwrap();
+                assert_eq!(
+                    unit.ability,
+                    MONSTERS[faction as usize * 3 + usize::from(level - 1)].5
+                );
+                assert_eq!(unit.name, definition.0);
+                assert_eq!(game.combatant_name(Creature(id)), unit.name);
+            }
+        }
+        assert_eq!(game.units().len(), 6);
+    }
+}
+
+#[test]
+fn legal_actions_agree_with_apply() {
+    fn check(game: &Game, candidates: Vec<Action>) {
+        let mut actions = game.legal_actions();
+        for action in candidates {
+            if game.clone().apply(action).is_ok() {
+                let idx = actions
+                    .iter()
+                    .position(|&a| a == action)
+                    .expect("合法手の列挙漏れ");
+                actions.swap_remove(idx);
+            }
+        }
+        assert!(actions.is_empty(), "違法手または重複: {actions:?}");
+    }
+    let mut game = seeded_roll([0; 3]);
+    let mut rolls = Vec::new();
+    for a in 0..=5 {
+        for b in 0..=5 {
+            for c in 0..=5 {
+                rolls.push(Action::Roll { dice: [a, b, c] });
+            }
+        }
+    }
+    check(&game, rolls);
+    game.apply(Action::Roll { dice: [1; 3] }).unwrap();
+    let mut placements = Vec::new();
+    for shape in 0..11 {
+        for rot in 0..4 {
+            for flip in [false, true] {
+                for x in 0..W {
+                    for y in 0..H {
+                        placements.push(Action::Place {
+                            shape,
+                            rot,
+                            flip,
+                            origin: (x, y),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    check(&game, placements);
+
+    let mut game = corridor(P1);
+    game.set_logging(false);
+    game.turn_player = P2;
+    game.summon(2, (2, 5));
+    game.summon(3, (4, 5));
+    game.turn_player = P1;
+    game.summon(3, (3, 5));
+    game.summon(1, (1, 5));
+    for player in [P1, P2] {
+        game.turn_player = player;
+        game.runes[player.index()] = RunePool {
+            movement: 4,
+            attack: 2,
+            magic: 1,
+            trap: 1,
+            guard: 1,
+        };
+        let mut candidates = vec![Action::EndTurn];
+        let combatants: Vec<_> = (0..6)
+            .map(Creature)
+            .chain([Warden(P1), Warden(P2)])
+            .collect();
+        for &attacker in &combatants {
+            for &target in &combatants {
+                candidates.push(Action::Attack { attacker, target });
+                if let Creature(id) = attacker {
+                    candidates.push(Action::TwinStrike {
+                        attacker: id,
+                        target,
+                    });
+                }
+            }
+        }
+        for unit in 0..6 {
+            candidates.push(Action::Wings { unit });
+            for x in 0..W {
+                for y in 0..H {
+                    candidates.push(Action::Move { unit, to: (x, y) });
+                }
+            }
+        }
+        check(&game, candidates);
+    }
+    game.turn_player = P1;
+    game.apply(Action::Attack {
+        attacker: Creature(2),
+        target: Creature(5),
+    })
+    .unwrap();
+    check(
+        &game,
+        [
+            DefenseChoice::None,
+            DefenseChoice::Guard,
+            DefenseChoice::Ward,
+        ]
+        .map(Action::Defend)
+        .to_vec(),
+    );
+    game.finish(Outcome::Draw, EndReason::TurnLimit);
+    assert!(game.legal_actions().is_empty());
+    assert!(game.log().is_empty());
+}
+
+#[test]
+fn domain_path_requires_edge_contact_along_tiles() {
+    let mut game = corridor(P1);
+    game.board[5][5] = Cell::Tile(P2);
+    game.summon(1, (5, 5));
+    assert!(game.domains_connected());
+    game.board[5][6] = Cell::Empty;
+    game.board[4][6] = Cell::Tile(P2);
+    assert!(!game.domains_connected());
+}
+
+#[test]
+fn greedy_falls_back_to_level_two_when_placement_is_blocked() {
+    let mut game = Game::new(0);
+    for (x, y) in board::neighbors(P1.domain()) {
+        game.board[y][x] = Cell::Tile(P2);
+    }
+    assert!(!game.has_summoned(P1, 1));
+    assert_eq!(ai::choose(&game), Action::Roll { dice: [2; 3] });
+}
+
+#[test]
+fn logging_does_not_change_random_play() {
+    let mut logged = Game::new(17);
+    let mut quiet = logged.clone();
+    quiet.set_logging(false);
+    let mut rng = fastrand::Rng::with_seed(41);
+    let mut other_rng = rng.clone();
+    while logged.to_act().is_some() {
+        let a = ai::choose_random(&logged, &mut rng);
+        assert_eq!(ai::choose_random(&quiet, &mut other_rng), a);
+        logged.apply(a).unwrap();
+        quiet.apply(a).unwrap();
+        assert_eq!(logged.last_roll(), quiet.last_roll());
+    }
+    assert!(!logged.log().is_empty());
+    assert!(quiet.log().is_empty());
+    assert_eq!(logged.outcome(), quiet.outcome());
+    assert_eq!(logged.end_reason(), quiet.end_reason());
+    assert_eq!(logged.board(), quiet.board());
+    assert_eq!(logged.units(), quiet.units());
 }

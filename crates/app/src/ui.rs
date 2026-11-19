@@ -2,8 +2,8 @@
 //! ルール判定は持たず、`delvers-core` のクエリ (`reachable` / `attack_targets` / `is_legal_placement` など) に任せる。
 
 use delvers_core::{
-    Ability, Action, Cell, Combatant, DICE_FACES, DefenseChoice, Face, Game, MONSTERS, Outcome,
-    Phase, Placement, Player, Pos, Rune, WARDEN_ATK, ai, monster, placement_cells,
+    Ability, Action, Cell, Combatant, DICE_FACES, DefenseChoice, Face, Game, Outcome, Phase,
+    Placement, Player, Pos, Rune, WARDEN_ATK, ai, placement_cells,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, vec2};
 
@@ -235,7 +235,7 @@ impl Play {
 
         if let Some(outcome) = self.game.outcome() {
             let text = match outcome {
-                Outcome::Win(p) => format!("{} の勝ち！", p.name()),
+                Outcome::Win(p) => format!("{} の勝ち！", self.game.player_name(p)),
                 Outcome::Draw => "引き分け".to_owned(),
             };
             egui::Window::new("対局終了")
@@ -590,7 +590,7 @@ impl Play {
             let active = g.to_act() == Some(p);
             ui.separator();
             ui.horizontal(|ui| {
-                let t = egui::RichText::new(format!("{}{who}", p.name()))
+                let t = egui::RichText::new(format!("{}{who}", g.player_name(p)))
                     .color(p_color(p))
                     .strong();
                 ui.label(t);
@@ -605,7 +605,7 @@ impl Play {
                 r.movement, r.attack, r.guard, r.magic, r.trap
             ));
             for lv in 1..=3u8 {
-                let (id, &(name, lv, hp, atk, def, ab)) = monster(p, lv).unwrap();
+                let (id, &(name, lv, hp, atk, def, ab)) = g.monster(p, lv).unwrap();
                 let state = match g.unit(id) {
                     Some(u) => format!("場に出ている HP {}/{}", u.hp, u.max_hp),
                     None if g.has_summoned(p, lv) => "撃破".to_owned(),
@@ -636,7 +636,7 @@ impl Play {
         ui.horizontal_wrapped(|ui| {
             if let Some(p) = g.to_act() {
                 ui.label(
-                    egui::RichText::new(format!("手番: {}", g.turn_player().name()))
+                    egui::RichText::new(format!("手番: {}", g.player_name(g.turn_player())))
                         .color(p_color(g.turn_player()))
                         .strong(),
                 );
@@ -734,7 +734,12 @@ impl Play {
     }
 
     fn place_ui(&mut self, ui: &mut egui::Ui, level: u8) {
-        let name = monster(self.game.turn_player(), level).unwrap().1.0;
+        let name = self
+            .game
+            .monster(self.game.turn_player(), level)
+            .unwrap()
+            .1
+            .0;
         ui.label(format!(
             "Lv{level} {name} を召喚: 形を選び、盤面でタイルを置く場所をクリック (金枠 = 召喚マス)"
         ));
@@ -768,9 +773,12 @@ impl Play {
                     } else {
                         ""
                     };
-                    ui.label(format!("選択中: {} ATK {WARDEN_ATK}{status}", c.name()))
+                    ui.label(format!(
+                        "選択中: {} ATK {WARDEN_ATK}{status}",
+                        g.combatant_name(c)
+                    ))
                 }
-                Some(c) => ui.label(format!("選択中: {}", c.name())),
+                Some(c) => ui.label(format!("選択中: {}", g.combatant_name(c))),
                 None => ui.label("自分のユニットかウォーデンをクリックして選択"),
             };
             if let Some(Combatant::Unit(id)) = self.sel.unit {
@@ -816,8 +824,8 @@ impl Play {
         let g = &self.game;
         ui.label(format!(
             "{} が {} を攻撃！ (残り {hits_left} 撃) 防御を選んでください:",
-            attacker.name(),
-            MONSTERS[target].0
+            g.combatant_name(attacker),
+            g.combatant_name(Combatant::Unit(target))
         ));
         let mut act = None;
         ui.horizontal(|ui| {
