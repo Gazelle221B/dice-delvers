@@ -576,7 +576,11 @@ impl Game {
                 .unit(attacker)
                 .is_some_and(|unit| unit.ability == Ability::TwinStrike)
         {
+            // 能力はウォーデンに作用しない (SPEC §4)
             self.attack_targets(Combatant::Unit(attacker))
+                .into_iter()
+                .filter(|target| matches!(target, Combatant::Unit(_)))
+                .collect()
         } else {
             Vec::new()
         }
