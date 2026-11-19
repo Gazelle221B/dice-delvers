@@ -4,20 +4,18 @@
 
 pub mod ai;
 mod board;
+mod rules;
 #[cfg(test)]
 mod tests;
 
 pub use board::{SHAPES, placement_cells};
+pub use rules::{Die, Faction, Monster, Ruleset};
 
-/// 盤面の列数。
-pub const W: usize = 13;
-/// 盤面の行数。
-pub const H: usize = 11;
-/// ウォーデンの攻撃力。
-pub const WARDEN_ATK: u8 = 10;
+use std::sync::Arc;
 
 pub type Pos = (usize, usize);
-/// 席とレベルで決まる、対局中に再利用されないユニット ID。
+/// 席ごとのロスター順に P1 から通し番号を振った、対局中に再利用されないユニット ID。
+/// 召喚前・撃破後も同じモンスターを指す。
 pub type UnitId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,44 +24,15 @@ pub enum Player {
     P2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Faction {
-    Ember,
-    Frost,
-}
-
-const DEFAULT_FACTIONS: [Faction; 2] = [Faction::Ember, Faction::Frost];
-
 impl Player {
     pub const fn index(self) -> usize {
         self as usize
-    }
-
-    /// 通常対局での表示名。計測用の陣営設定には Game::player_name を使う。
-    pub const fn name(self) -> &'static str {
-        self.name_with(DEFAULT_FACTIONS)
-    }
-
-    const fn name_with(self, factions: [Faction; 2]) -> &'static str {
-        match (self, factions[self.index()]) {
-            (Self::P1, Faction::Ember) => "P1 Ember",
-            (Self::P1, Faction::Frost) => "P1 Frost",
-            (Self::P2, Faction::Ember) => "P2 Ember",
-            (Self::P2, Faction::Frost) => "P2 Frost",
-        }
     }
 
     pub const fn opponent(self) -> Self {
         match self {
             Self::P1 => Self::P2,
             Self::P2 => Self::P1,
-        }
-    }
-
-    pub const fn domain(self) -> Pos {
-        match self {
-            Self::P1 => (0, 5),
-            Self::P2 => (W - 1, 5),
         }
     }
 }
@@ -122,46 +91,6 @@ pub struct DieRoll {
     pub face: Face,
 }
 
-/// レベル 1〜4 の面を順に収録。
-pub const DICE_FACES: [[Face; 6]; 4] = {
-    use Face::{Rune as Run, Summon};
-    use Rune::{Attack, Guard, Magic, Move, Trap};
-    [
-        [
-            Summon(1),
-            Summon(1),
-            Summon(1),
-            Summon(1),
-            Run(Move, 1),
-            Run(Guard, 2),
-        ],
-        [
-            Summon(2),
-            Summon(2),
-            Summon(2),
-            Run(Move, 2),
-            Run(Attack, 2),
-            Run(Magic, 1),
-        ],
-        [
-            Summon(3),
-            Summon(3),
-            Run(Move, 1),
-            Run(Move, 1),
-            Run(Attack, 1),
-            Run(Trap, 2),
-        ],
-        [
-            Summon(4),
-            Run(Move, 2),
-            Run(Attack, 1),
-            Run(Guard, 1),
-            Run(Magic, 2),
-            Run(Trap, 1),
-        ],
-    ]
-};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ability {
     Swift,
@@ -170,38 +99,6 @@ pub enum Ability {
     Flying,
     TwinStrike,
     Ward,
-}
-
-/// 陣営・レベル順のモンスター定義 (名前、レベル、HP、ATK、DEF、能力)。
-pub const MONSTERS: [Monster; 6] = [
-    ("Bramble Squire", 1, 20, 10, 10, Ability::Swift),
-    ("Cinder Hound", 2, 30, 20, 10, Ability::Tunnel),
-    ("Ash Colossus", 3, 40, 30, 20, Ability::Wings),
-    ("Rime Sprite", 1, 10, 10, 10, Ability::Flying),
-    ("Glacier Duelist", 2, 30, 20, 10, Ability::TwinStrike),
-    ("Frost Leviathan", 3, 40, 30, 20, Ability::Ward),
-];
-
-pub type Monster = (&'static str, u8, u8, u8, u8, Ability);
-
-/// 通常対局のユニット ID と定義。陣営指定のある対局には Game::monster を使う。
-pub fn monster(player: Player, level: u8) -> Option<(UnitId, &'static Monster)> {
-    roster_monster(DEFAULT_FACTIONS, player, level)
-}
-
-fn roster_monster(
-    factions: [Faction; 2],
-    player: Player,
-    level: u8,
-) -> Option<(UnitId, &'static Monster)> {
-    if !(1..=3).contains(&level) {
-        return None;
-    }
-    let id = player.index() * 3 + usize::from(level - 1);
-    Some((
-        id,
-        &MONSTERS[factions[player.index()] as usize * 3 + usize::from(level - 1)],
-    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,22 +122,6 @@ pub struct Unit {
 pub enum Combatant {
     Unit(UnitId),
     Warden(Player),
-}
-
-impl Combatant {
-    /// 通常対局での表示名。陣営指定のある対局には Game::combatant_name を使う。
-    pub fn name(self) -> String {
-        self.name_with(DEFAULT_FACTIONS)
-    }
-
-    fn name_with(self, factions: [Faction; 2]) -> String {
-        match self {
-            Self::Unit(id) => MONSTERS[factions[id / 3] as usize * 3 + id % 3]
-                .0
-                .to_owned(),
-            Self::Warden(player) => format!("{} のウォーデン", player.name_with(factions)),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,10 +176,11 @@ impl Placement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// 振るダイスのレベルを Ruleset::dice_per_roll 個並べる。
     Roll {
-        dice: [u8; 3],
+        dice: Vec<u8>,
     },
     Place {
         shape: u8,
@@ -351,7 +233,7 @@ impl std::fmt::Display for RuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::WrongPhase => "現在のフェーズでは実行できません",
-            Self::InvalidDice => "ダイスのレベルは 1〜4 です",
+            Self::InvalidDice => "ダイスの選び方が不正です",
             Self::InvalidPlacement => "この場所に配置できません",
             Self::InvalidMove => "このマスには移動できません",
             Self::InvalidAttack => "この組み合わせでは攻撃できません",
@@ -365,42 +247,58 @@ impl std::error::Error for RuleError {}
 
 #[derive(Debug, Clone)]
 pub struct Game {
-    factions: [Faction; 2],
+    rules: Arc<Ruleset>,
+    /// 各席に割り当てた Ruleset::factions の添字。
+    seats: [usize; 2],
     rng: fastrand::Rng,
-    board: [[Cell; W]; H],
+    board: Vec<Vec<Cell>>,
     units: Vec<Unit>,
     runes: [RunePool; 2],
     lp: [u8; 2],
-    summoned: [u8; 2],
+    /// UnitId で引く召喚済みフラグ。撃破後も true のまま。
+    summoned: Vec<bool>,
     warden_attacked: bool,
     turn_player: Player,
     turn: u16,
     phase: Phase,
-    last_roll: Option<[DieRoll; 3]>,
+    last_roll: Option<Vec<DieRoll>>,
     log: Vec<String>,
     logging: bool,
     end_reason: Option<EndReason>,
 }
 
 impl Game {
-    pub fn new(seed: u64) -> Self {
-        Self::with_factions(seed, DEFAULT_FACTIONS)
-    }
-
-    pub fn with_factions(seed: u64, factions: [Faction; 2]) -> Self {
-        let mut board = [[Cell::Empty; W]; H];
-        for player in [Player::P1, Player::P2] {
-            let (x, y) = player.domain();
-            board[y][x] = Cell::Domain(player);
-        }
-        Self {
-            factions,
+    /// seats は各席の陣営 (Ruleset::factions の添字)。ルールセットが不正ならパニックする。
+    pub fn new(rules: Arc<Ruleset>, seats: [usize; 2], seed: u64) -> Self {
+        assert!(rules.width >= 2 && rules.height >= 1, "盤面が小さすぎる");
+        assert!(
+            rules.dice_per_roll >= 1
+                && rules.dice.len() <= usize::from(u8::MAX)
+                && rules
+                    .dice
+                    .iter()
+                    .map(|die| usize::from(die.copies))
+                    .sum::<usize>()
+                    >= rules.dice_per_roll,
+            "1 手番に振る個数のダイスが置き場に無い"
+        );
+        assert!(
+            seats.iter().all(|&seat| seat < rules.factions.len()),
+            "陣営の添字が範囲外"
+        );
+        let mut board = vec![vec![Cell::Empty; rules.width]; rules.height];
+        let units = seats
+            .iter()
+            .map(|&seat| rules.factions[seat].monsters.len())
+            .sum();
+        let mut game = Self {
+            seats,
             rng: fastrand::Rng::with_seed(seed),
-            board,
+            board: Vec::new(),
             units: Vec::new(),
             runes: [RunePool::default(); 2],
-            lp: [3; 2],
-            summoned: [0; 2],
+            lp: [rules.lp; 2],
+            summoned: vec![false; units],
             warden_attacked: false,
             turn_player: Player::P1,
             turn: 1,
@@ -409,23 +307,88 @@ impl Game {
             log: Vec::new(),
             logging: true,
             end_reason: None,
+            rules,
+        };
+        for player in [Player::P1, Player::P2] {
+            let (x, y) = game.domain(player);
+            board[y][x] = Cell::Domain(player);
+        }
+        game.board = board;
+        game
+    }
+
+    pub fn rules(&self) -> &Ruleset {
+        &self.rules
+    }
+
+    pub fn faction(&self, player: Player) -> &Faction {
+        &self.rules.factions[self.seats[player.index()]]
+    }
+
+    pub fn domain(&self, player: Player) -> Pos {
+        let y = self.rules.height / 2;
+        match player {
+            Player::P1 => (0, y),
+            Player::P2 => (self.rules.width - 1, y),
         }
     }
 
-    pub fn monster(&self, player: Player, level: u8) -> Option<(UnitId, &'static Monster)> {
-        roster_monster(self.factions, player, level)
+    /// 席のロスターをユニット ID つきで返す。
+    pub fn roster(&self, player: Player) -> impl Iterator<Item = (UnitId, &Monster)> {
+        let first = match player {
+            Player::P1 => 0,
+            Player::P2 => self.faction(Player::P1).monsters.len(),
+        };
+        self.faction(player)
+            .monsters
+            .iter()
+            .enumerate()
+            .map(move |(slot, monster)| (first + slot, monster))
     }
 
-    pub fn player_name(&self, player: Player) -> &'static str {
-        player.name_with(self.factions)
+    /// ユニット ID の持ち主と定義。召喚前・撃破後も引ける。
+    pub fn monster(&self, id: UnitId) -> Option<(Player, &Monster)> {
+        let p1 = self.faction(Player::P1).monsters.len();
+        if id < p1 {
+            Some((Player::P1, &self.faction(Player::P1).monsters[id]))
+        } else {
+            let monster = self.faction(Player::P2).monsters.get(id - p1)?;
+            Some((Player::P2, monster))
+        }
+    }
+
+    /// 撃破されたモンスターも召喚済みとして数える。
+    pub fn is_summoned(&self, id: UnitId) -> bool {
+        self.summoned.get(id).copied().unwrap_or(false)
+    }
+
+    /// まだ召喚していないロスターのモンスター。
+    pub fn unsummoned(&self, player: Player) -> impl Iterator<Item = (UnitId, &Monster)> {
+        self.roster(player).filter(|&(id, _)| !self.summoned[id])
+    }
+
+    /// そのレベルの召喚面が揃ったときに召喚されるモンスター。
+    pub fn summonable(&self, player: Player, level: u8) -> Option<UnitId> {
+        self.unsummoned(player)
+            .find(|(_, monster)| monster.level == level)
+            .map(|(id, _)| id)
+    }
+
+    pub fn player_name(&self, player: Player) -> String {
+        format!("P{} {}", player.index() + 1, self.faction(player).name)
     }
 
     pub fn combatant_name(&self, combatant: Combatant) -> String {
-        combatant.name_with(self.factions)
+        match combatant {
+            Combatant::Unit(id) => self
+                .monster(id)
+                .map_or_else(|| format!("ユニット {id}"), |(_, m)| m.name.to_owned()),
+            Combatant::Warden(player) => format!("{} のウォーデン", self.player_name(player)),
+        }
     }
 
     /// 行優先（board[y][x]）の盤面。ユニットの位置は units で参照する。
-    pub fn board(&self) -> &[[Cell; W]; H] {
+    pub fn board(&self) -> &[Vec<Cell>] {
         &self.board
     }
 
@@ -451,11 +414,6 @@ impl Game {
 
     pub fn lp(&self, player: Player) -> u8 {
         self.lp[player.index()]
-    }
-
-    /// 撃破されたモンスターも召喚済みとして数える。
-    pub fn has_summoned(&self, player: Player, level: u8) -> bool {
-        (1..=3).contains(&level) && self.summoned[player.index()] & (1 << (level - 1)) != 0
     }
 
     pub fn turn_player(&self) -> Player {
@@ -496,8 +454,8 @@ impl Game {
         }
     }
 
-    pub fn last_roll(&self) -> Option<&[DieRoll; 3]> {
-        self.last_roll.as_ref()
+    pub fn last_roll(&self) -> Option<&[DieRoll]> {
+        self.last_roll.as_deref()
     }
 
     pub fn log(&self) -> &[String] {
@@ -514,12 +472,18 @@ impl Game {
         let mut actions = Vec::new();
         match self.phase {
             Phase::Roll => {
-                for a in 1..=4 {
-                    for b in 1..=4 {
-                        for c in 1..=4 {
-                            actions.push(Action::Roll { dice: [a, b, c] });
-                        }
+                // 先頭のダイスを最上位の桁とする辞書順に全組み合わせを数え上げる。
+                let levels = self.rules.dice.len() as u8;
+                let mut dice = vec![1; self.rules.dice_per_roll];
+                loop {
+                    if self.valid_dice(&dice) {
+                        actions.push(Action::Roll { dice: dice.clone() });
                     }
+                    let Some(i) = dice.iter().rposition(|&level| level < levels) else {
+                        break;
+                    };
+                    dice[i] += 1;
+                    dice[i + 1..].fill(1);
                 }
             }
             Phase::Place { .. } => {
@@ -611,47 +575,81 @@ impl Game {
         }
     }
 
-    fn roll(&mut self, dice: [u8; 3]) -> Result<(), RuleError> {
-        if !dice.iter().all(|level| (1..=4).contains(level)) {
+    /// 個数・レベル・ダイス置き場の在庫を満たすか。
+    fn valid_dice(&self, dice: &[u8]) -> bool {
+        dice.len() == self.rules.dice_per_roll
+            && dice.iter().all(|&level| {
+                level >= 1
+                    && self
+                        .rules
+                        .dice
+                        .get(usize::from(level - 1))
+                        .is_some_and(|die| {
+                            dice.iter().filter(|&&other| other == level).count()
+                                <= usize::from(die.copies)
+                        })
+            })
+    }
+
+    fn roll(&mut self, dice: Vec<u8>) -> Result<(), RuleError> {
+        if !self.valid_dice(&dice) {
             return Err(RuleError::InvalidDice);
         }
-        let rolls = dice.map(|level| DieRoll {
-            level,
-            face: DICE_FACES[usize::from(level - 1)][self.rng.usize(0..6)],
-        });
+        let rolls: Vec<_> = dice
+            .into_iter()
+            .map(|level| {
+                let faces = &self.rules.dice[usize::from(level - 1)].faces;
+                DieRoll {
+                    level,
+                    face: faces[self.rng.usize(0..faces.len())],
+                }
+            })
+            .collect();
         let player = self.turn_player;
         let pool = &mut self.runes[player.index()];
-        let mut summons = [0; 4];
-        for roll in rolls {
+        let mut summons = Vec::new();
+        for roll in &rolls {
             match roll.face {
-                Face::Summon(level) => summons[usize::from(level - 1)] += 1,
+                Face::Summon(level) => summons.push(level),
                 Face::Rune(rune, count) => {
                     let amount = pool.amount_mut(rune);
-                    *amount = (*amount + count).min(10);
+                    *amount = amount.saturating_add(count).min(self.rules.rune_cap);
                 }
             }
         }
         self.last_roll = Some(rolls);
         if self.logging {
-            self.log.push(format!(
-                "{} がダイスを振った",
-                player.name_with(self.factions)
-            ));
+            self.log
+                .push(format!("{} がダイスを振った", self.player_name(player)));
         }
 
-        self.phase = (1..=3)
-            .find(|&level| {
-                summons[usize::from(level - 1)] >= 2 && !self.has_summoned(player, level)
-            })
+        // 同レベルの召喚面が 2 個以上出たレベルのうち、召喚できる最も低いレベル。
+        summons.sort_unstable();
+        self.phase = summons
+            .windows(2)
+            .filter(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+            .find(|&level| self.summonable(player, level).is_some())
             .filter(|_| self.placements(player).next().is_some())
             .map_or(Phase::Action, |level| Phase::Place { level });
         Ok(())
     }
 
+    /// 手番側のそのレベルの未召喚モンスターを pos に出す。呼び出し側で召喚可能を確かめる。
     fn summon(&mut self, level: u8, pos: Pos) {
         let owner = self.turn_player;
-        let (id, &(name, level, hp, atk, def, ability)) = self.monster(owner, level).unwrap();
-        self.summoned[owner.index()] |= 1 << (level - 1);
+        let id = self
+            .summonable(owner, level)
+            .expect("召喚できるモンスターがいる");
+        let &Monster {
+            name,
+            level,
+            hp,
+            atk,
+            def,
+            ability,
+        } = self.monster(id).unwrap().1;
+        self.summoned[id] = true;
         self.units.push(Unit {
             id,
             owner,
@@ -668,10 +666,8 @@ impl Game {
             attacked: false,
         });
         if self.logging {
-            self.log.push(format!(
-                "{} が {name} を召喚",
-                owner.name_with(self.factions)
-            ));
+            self.log
+                .push(format!("{} が {name} を召喚", self.player_name(owner)));
         }
     }
 
@@ -724,7 +720,7 @@ impl Game {
                 _ => return Vec::new(),
             },
             Combatant::Warden(owner) if owner == player && !self.warden_attacked => {
-                (owner.domain(), true)
+                (self.domain(owner), true)
             }
             _ => return Vec::new(),
         };
@@ -735,11 +731,11 @@ impl Game {
             .filter(|unit| {
                 unit.owner == enemy
                     && (!unit.flying || can_hit_flying)
-                    && board::neighbors(pos).any(|p| p == unit.pos)
+                    && self.neighbors(pos).any(|p| p == unit.pos)
             })
             .map(|unit| Combatant::Unit(unit.id))
             .collect();
-        if board::neighbors(pos).any(|p| p == enemy.domain()) {
+        if self.neighbors(pos).any(|p| p == self.domain(enemy)) {
             targets.push(Combatant::Warden(enemy));
         }
         targets
@@ -793,21 +789,21 @@ impl Game {
         if self.logging {
             self.log.push(format!(
                 "{} が {} を攻撃",
-                attacker.name_with(self.factions),
-                target.name_with(self.factions)
+                self.combatant_name(attacker),
+                self.combatant_name(target)
             ));
         }
         match target {
             Combatant::Warden(player) => {
-                let lp = &mut self.lp[player.index()];
-                *lp = lp.saturating_sub(hits);
+                let lp = self.lp[player.index()].saturating_sub(hits);
+                self.lp[player.index()] = lp;
                 if self.logging {
                     self.log.push(format!(
                         "{} のウォーデンが被弾 (LP {lp})",
-                        player.name_with(self.factions)
+                        self.player_name(player)
                     ));
                 }
-                if *lp == 0 {
+                if lp == 0 {
                     self.finish(Outcome::Win(self.turn_player), EndReason::LpZero);
                 }
             }
@@ -851,7 +847,7 @@ impl Game {
         }
         let atk = match attacker {
             Combatant::Unit(id) => self.unit(id).unwrap().atk,
-            Combatant::Warden(_) => WARDEN_ATK,
+            Combatant::Warden(_) => self.rules.warden_atk,
         };
         let def = self.unit(target).unwrap().def;
         Some(match choice {
@@ -913,7 +909,7 @@ impl Game {
     }
 
     fn end_turn(&mut self) {
-        if self.turn == 300 {
+        if self.turn == self.rules.turn_limit {
             self.finish_by_score(EndReason::TurnLimit);
         } else {
             self.check_stalemate();
@@ -934,22 +930,19 @@ impl Game {
     fn check_stalemate(&mut self) {
         if self.units.is_empty()
             && [Player::P1, Player::P2].into_iter().all(|player| {
-                (1..=3).all(|level| self.has_summoned(player, level))
-                    || self.placements(player).next().is_none()
+                self.unsummoned(player).next().is_none() || self.placements(player).next().is_none()
             })
         {
             self.finish_by_score(EndReason::Stalemate);
         }
     }
 
-    fn score(&self, player: Player) -> (u8, u32, u8) {
-        let level_total = (1..=3)
-            .filter(|&level| self.has_summoned(player, level))
-            .sum();
+    fn score(&self, player: Player) -> (u8, usize, u32) {
+        let summoned = || self.roster(player).filter(|&(id, _)| self.summoned[id]);
         (
             self.lp(player),
-            self.summoned[player.index()].count_ones(),
-            level_total,
+            summoned().count(),
+            summoned().map(|(_, m)| u32::from(m.level)).sum(),
         )
     }
 
@@ -971,7 +964,7 @@ impl Game {
         if self.logging {
             self.log.push(match outcome {
                 Outcome::Win(player) => {
-                    format!("対局終了：{} の勝ち", player.name_with(self.factions))
+                    format!("対局終了：{} の勝ち", self.player_name(player))
                 }
                 Outcome::Draw => "対局終了：引き分け".to_owned(),
             });

@@ -5,9 +5,8 @@
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 
-pub const COLS: usize = 13;
-pub const ROWS: usize = 11;
-pub const CELLS: usize = COLS * ROWS;
+/// シェーダの uniform 配列 (vec4<u32> × 36) に収まる最大マス数。これを超えるルールセットは描画できない。
+pub const MAX_CELLS: usize = 36 * 4;
 
 /// `BoardView::cells` の値。
 pub mod cell {
@@ -27,27 +26,40 @@ pub mod hl {
     pub const INVALID: u8 = 4;
 }
 
-/// シェーダへ渡す盤面データ。インデックスは `y * COLS + x`。
+/// シェーダへ渡す盤面データ。インデックスは `y * cols + x`。
 #[derive(Clone)]
 pub struct BoardView {
-    pub cells: [u8; CELLS],
-    pub highlight: [u8; CELLS],
+    pub cols: usize,
+    pub rows: usize,
+    pub cells: [u8; MAX_CELLS],
+    pub highlight: [u8; MAX_CELLS],
     /// アニメ用の秒数
     pub time: f32,
 }
 
-impl Default for BoardView {
-    fn default() -> Self {
+impl BoardView {
+    /// 盤面が MAX_CELLS を超えるとパニックする。
+    pub fn new(cols: usize, rows: usize, time: f32) -> Self {
+        assert!(
+            cols >= 1 && rows >= 1 && cols * rows <= MAX_CELLS,
+            "{cols}×{rows} の盤面は描画できない (最大 {MAX_CELLS} マス)"
+        );
         Self {
-            cells: [cell::EMPTY; CELLS],
-            highlight: [hl::NONE; CELLS],
-            time: 0.0,
+            cols,
+            rows,
+            cells: [cell::EMPTY; MAX_CELLS],
+            highlight: [hl::NONE; MAX_CELLS],
+            time,
         }
+    }
+
+    pub fn set_highlight(&mut self, (x, y): (usize, usize), value: u8) {
+        self.highlight[y * self.cols + x] = value;
     }
 }
 
-/// uniform のサイズ: vec4<u32> × 36 (セル) + vec4<f32> (params)
-const UNIFORM_WORDS: usize = 36 * 4 + 4;
+/// uniform のサイズ: vec4<u32> × 36 (セル) + vec4<f32> (params) + vec4<u32> (盤面サイズ)
+const UNIFORM_WORDS: usize = MAX_CELLS + 8;
 
 impl BoardView {
     fn pack(&self) -> [u32; UNIFORM_WORDS] {
@@ -55,24 +67,30 @@ impl BoardView {
         for (i, (&c, &h)) in self.cells.iter().zip(&self.highlight).enumerate() {
             w[i] = u32::from(c) | (u32::from(h) << 8);
         }
-        w[36 * 4] = self.time.to_bits();
+        w[MAX_CELLS] = self.time.to_bits();
+        w[MAX_CELLS + 4] = self.cols as u32;
+        w[MAX_CELLS + 5] = self.rows as u32;
         w
     }
 }
 
 /// 画面上の盤面矩形 `rect` 内の点 `pos` をセル座標 (x, y) に変換。盤外なら `None`。
-pub fn cell_at(rect: egui::Rect, pos: egui::Pos2) -> Option<(usize, usize)> {
+pub fn cell_at(
+    rect: egui::Rect,
+    (cols, rows): (usize, usize),
+    pos: egui::Pos2,
+) -> Option<(usize, usize)> {
     if !rect.contains(pos) {
         return None;
     }
-    let x = ((pos.x - rect.min.x) / rect.width() * COLS as f32) as usize;
-    let y = ((pos.y - rect.min.y) / rect.height() * ROWS as f32) as usize;
-    Some((x.min(COLS - 1), y.min(ROWS - 1)))
+    let x = ((pos.x - rect.min.x) / rect.width() * cols as f32) as usize;
+    let y = ((pos.y - rect.min.y) / rect.height() * rows as f32) as usize;
+    Some((x.min(cols - 1), y.min(rows - 1)))
 }
 
 /// セル (x, y) の画面上の矩形 (ユニット等を egui painter で重ねる用)。
-pub fn cell_rect(rect: egui::Rect, x: usize, y: usize) -> egui::Rect {
-    let size = egui::vec2(rect.width() / COLS as f32, rect.height() / ROWS as f32);
+pub fn cell_rect(rect: egui::Rect, (cols, rows): (usize, usize), x: usize, y: usize) -> egui::Rect {
+    let size = egui::vec2(rect.width() / cols as f32, rect.height() / rows as f32);
     egui::Rect::from_min_size(
         rect.min + egui::vec2(x as f32 * size.x, y as f32 * size.y),
         size,
@@ -197,24 +215,30 @@ mod tests {
     #[test]
     fn cell_at_maps_corners_and_outside() {
         let r = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(130.0, 110.0));
-        assert_eq!(cell_at(r, egui::pos2(10.0, 20.0)), Some((0, 0)));
-        assert_eq!(cell_at(r, egui::pos2(139.9, 129.9)), Some((12, 10)));
-        assert_eq!(cell_at(r, egui::pos2(140.0, 130.0)), Some((12, 10))); // 右下端は内側扱い
-        assert_eq!(cell_at(r, egui::pos2(25.0, 45.0)), Some((1, 2)));
-        assert_eq!(cell_at(r, egui::pos2(9.0, 50.0)), None);
-        assert_eq!(cell_rect(r, 1, 2).min, egui::pos2(20.0, 40.0));
+        let dims = (13, 11);
+        assert_eq!(cell_at(r, dims, egui::pos2(10.0, 20.0)), Some((0, 0)));
+        assert_eq!(cell_at(r, dims, egui::pos2(139.9, 129.9)), Some((12, 10)));
+        assert_eq!(cell_at(r, dims, egui::pos2(140.0, 130.0)), Some((12, 10))); // 右下端は内側扱い
+        assert_eq!(cell_at(r, dims, egui::pos2(25.0, 45.0)), Some((1, 2)));
+        assert_eq!(cell_at(r, dims, egui::pos2(9.0, 50.0)), None);
+        assert_eq!(cell_rect(r, dims, 1, 2).min, egui::pos2(20.0, 40.0));
+        assert_eq!(cell_at(r, (10, 10), egui::pos2(139.9, 129.9)), Some((9, 9)));
     }
 
     #[test]
     fn pack_layout() {
-        let mut v = BoardView {
-            time: 1.5,
-            ..Default::default()
-        };
+        let mut v = BoardView::new(13, 11, 1.5);
         v.cells[142] = cell::TILE_P2;
-        v.highlight[142] = hl::INVALID;
+        v.set_highlight((12, 10), hl::INVALID);
         let w = v.pack();
         assert_eq!(w[142], 4 | (4 << 8));
         assert_eq!(f32::from_bits(w[144]), 1.5);
+        assert_eq!(w[148..150], [13, 11]);
+    }
+
+    #[test]
+    #[should_panic(expected = "描画できない")]
+    fn oversized_board_is_rejected() {
+        BoardView::new(13, 12, 0.0);
     }
 }

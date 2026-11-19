@@ -1,21 +1,37 @@
 //! その局面で実行できる行動を一手ずつ選ぶ CPU。
 
-use crate::{
-    Ability, Action, Combatant, DefenseChoice, Game, Phase, Player, Pos, WARDEN_ATK,
-    board::neighbors,
-};
+use crate::{Ability, Action, Combatant, DefenseChoice, Game, Phase, Player, Pos};
 
 /// game.to_act() が CPU を返す局面で呼ぶ。終局後に呼ぶとパニックする。
 pub fn choose(game: &Game) -> Action {
     let player = game.turn_player();
-    let enemy_domain = player.opponent().domain();
+    let enemy_domain = game.domain(player.opponent());
     match game.phase() {
         Phase::Roll => {
-            let level = (1..=3)
-                .find(|&level| !game.has_summoned(player, level))
+            // 未召喚の最低レベルを揃えて狙う。配置できなければ攻撃ルーンの出る Lv2。
+            let level = game
+                .unsummoned(player)
+                .map(|(_, monster)| monster.level)
+                .min()
                 .filter(|_| game.placements(player).next().is_some())
                 .unwrap_or(2);
-            Action::Roll { dice: [level; 3] }
+            let rules = game.rules();
+            let per_roll = rules.dice_per_roll;
+            let copies = rules.dice.get(usize::from(level - 1)).map(|die| die.copies);
+            if copies.is_some_and(|copies| usize::from(copies) >= per_roll) {
+                Action::Roll {
+                    dice: vec![level; per_roll],
+                }
+            } else {
+                // 在庫が足りなければ、狙うレベルを最も多く含む合法なロールの先頭。
+                game.legal_actions()
+                    .into_iter()
+                    .min_by_key(|action| match action {
+                        Action::Roll { dice } => dice.iter().filter(|&&lv| lv != level).count(),
+                        _ => unreachable!(),
+                    })
+                    .expect("ロールの合法手がある")
+            }
         }
         Phase::Place { .. } => {
             let placement = game
@@ -82,7 +98,7 @@ fn choose_unit_action(game: &Game, player: Player, enemy_domain: Pos) -> Action 
         && let Some(unit) = units().find(|unit| {
             !unit.attacked
                 && game.can_use_wings(unit.id)
-                && neighbors(unit.pos).any(|pos| {
+                && game.neighbors(unit.pos).any(|pos| {
                     game.unit_at(pos)
                         .is_some_and(|target| target.owner != player && target.flying)
                 })
@@ -116,7 +132,7 @@ fn attack_score(game: &Game, attacker: Combatant, target: Combatant, hits: u8) -
         Combatant::Unit(id) => {
             let unit = game.unit(id).unwrap();
             let atk = match attacker {
-                Combatant::Warden(_) => WARDEN_ATK,
+                Combatant::Warden(_) => game.rules().warden_atk,
                 Combatant::Unit(id) => game.unit(id).unwrap().atk,
             };
             let pool = game.runes(unit.owner);
@@ -139,6 +155,6 @@ fn distance(a: Pos, b: Pos) -> usize {
 
 /// 終局前の全合法手から、呼び出し側の乱数で一様に一手選ぶ。
 pub fn choose_random(game: &Game, rng: &mut fastrand::Rng) -> Action {
-    let actions = game.legal_actions();
-    actions[rng.usize(..actions.len())]
+    let mut actions = game.legal_actions();
+    actions.swap_remove(rng.usize(..actions.len()))
 }
