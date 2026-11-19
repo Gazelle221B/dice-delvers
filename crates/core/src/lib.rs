@@ -39,6 +39,7 @@ impl Player {
         self as usize
     }
 
+    /// 通常対局での表示名。計測用の陣営設定には Game::player_name を使う。
     pub const fn name(self) -> &'static str {
         self.name_with(DEFAULT_FACTIONS)
     }
@@ -183,7 +184,7 @@ pub const MONSTERS: [Monster; 6] = [
 
 pub type Monster = (&'static str, u8, u8, u8, u8, Ability);
 
-/// 陣営とレベルに対応するユニット ID と定義を返す。
+/// 通常対局のユニット ID と定義。陣営指定のある対局には Game::monster を使う。
 pub fn monster(player: Player, level: u8) -> Option<(UnitId, &'static Monster)> {
     roster_monster(DEFAULT_FACTIONS, player, level)
 }
@@ -227,6 +228,7 @@ pub enum Combatant {
 }
 
 impl Combatant {
+    /// 通常対局での表示名。陣営指定のある対局には Game::combatant_name を使う。
     pub fn name(self) -> String {
         self.name_with(DEFAULT_FACTIONS)
     }

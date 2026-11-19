@@ -675,3 +675,35 @@ fn domain_path_requires_edge_contact_along_tiles() {
     game.board[4][6] = Cell::Tile(P2);
     assert!(!game.domains_connected());
 }
+
+#[test]
+fn greedy_falls_back_to_level_two_when_placement_is_blocked() {
+    let mut game = Game::new(0);
+    for (x, y) in board::neighbors(P1.domain()) {
+        game.board[y][x] = Cell::Tile(P2);
+    }
+    assert!(!game.has_summoned(P1, 1));
+    assert_eq!(ai::choose(&game), Action::Roll { dice: [2; 3] });
+}
+
+#[test]
+fn logging_does_not_change_random_play() {
+    let mut logged = Game::new(17);
+    let mut quiet = logged.clone();
+    quiet.set_logging(false);
+    let mut rng = fastrand::Rng::with_seed(41);
+    let mut other_rng = rng.clone();
+    while logged.to_act().is_some() {
+        let a = ai::choose_random(&logged, &mut rng);
+        assert_eq!(ai::choose_random(&quiet, &mut other_rng), a);
+        logged.apply(a).unwrap();
+        quiet.apply(a).unwrap();
+        assert_eq!(logged.last_roll(), quiet.last_roll());
+    }
+    assert!(!logged.log().is_empty());
+    assert!(quiet.log().is_empty());
+    assert_eq!(logged.outcome(), quiet.outcome());
+    assert_eq!(logged.end_reason(), quiet.end_reason());
+    assert_eq!(logged.board(), quiet.board());
+    assert_eq!(logged.units(), quiet.units());
+}
