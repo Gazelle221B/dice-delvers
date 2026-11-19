@@ -7,3 +7,15 @@ license.workspace = true
 
 [dependencies]
 delvers-core = { path = "../core" }
+# 0.36+ は rust 1.95 必須のため 0.35 に固定
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+bytemuck = "1"
+log = "0.4"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Window", "HtmlCanvasElement"] }
+console_log = "1"
