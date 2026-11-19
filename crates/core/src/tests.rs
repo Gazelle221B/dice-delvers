@@ -259,6 +259,7 @@ fn flying_can_only_be_attacked_by_wardens_and_flying_units() {
     };
 
     let target = Creature(3);
+    assert!(!game.warden_attacked());
     assert!(!game.attack_targets(Creature(2)).contains(&target));
     assert!(game.attack_targets(Warden(P1)).contains(&target));
     game.apply(Action::Wings { unit: 2 }).unwrap();
@@ -276,12 +277,19 @@ fn flying_can_only_be_attacked_by_wardens_and_flying_units() {
         target,
     })
     .unwrap();
+    assert!(game.warden_attacked());
     assert_eq!(game.to_act(), Some(P2));
+    assert_eq!(
+        game.log().last().unwrap(),
+        "P1 Ember のウォーデン が Rime Sprite を攻撃"
+    );
     assert_eq!(game.pending_damage(DefenseChoice::None), Some(10));
     game.apply(Action::Defend(DefenseChoice::None)).unwrap();
     assert!(game.unit(3).is_none());
     assert!(game.has_summoned(P2, 1));
     assert!(!game.attack_targets(Warden(P1)).contains(&target));
+    game.apply(Action::EndTurn).unwrap();
+    assert!(!game.warden_attacked());
 }
 
 #[test]

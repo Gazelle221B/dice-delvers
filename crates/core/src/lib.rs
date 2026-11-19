@@ -13,6 +13,8 @@ pub use board::{SHAPES, placement_cells};
 pub const W: usize = 13;
 /// 盤面の行数。
 pub const H: usize = 11;
+/// ウォーデンの攻撃力。
+pub const WARDEN_ATK: u8 = 10;
 
 pub type Pos = (usize, usize);
 /// 陣営とレベルで決まる、対局中に再利用されないユニット ID。
@@ -27,6 +29,13 @@ pub enum Player {
 impl Player {
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::P1 => "P1 Ember",
+            Self::P2 => "P2 Frost",
+        }
     }
 
     pub const fn opponent(self) -> Self {
@@ -148,6 +157,27 @@ pub enum Ability {
     Ward,
 }
 
+/// ユニット ID 順のモンスター定義 (名前、レベル、HP、ATK、DEF、能力)。
+pub const MONSTERS: [Monster; 6] = [
+    ("Bramble Squire", 1, 20, 10, 10, Ability::Swift),
+    ("Cinder Hound", 2, 30, 20, 10, Ability::Tunnel),
+    ("Ash Colossus", 3, 40, 30, 20, Ability::Wings),
+    ("Rime Sprite", 1, 10, 10, 10, Ability::Flying),
+    ("Glacier Duelist", 2, 30, 20, 10, Ability::TwinStrike),
+    ("Frost Leviathan", 3, 40, 30, 20, Ability::Ward),
+];
+
+pub type Monster = (&'static str, u8, u8, u8, u8, Ability);
+
+/// 陣営とレベルに対応するユニット ID と定義を返す。
+pub fn monster(player: Player, level: u8) -> Option<(UnitId, &'static Monster)> {
+    if !(1..=3).contains(&level) {
+        return None;
+    }
+    let id = player.index() * 3 + usize::from(level - 1);
+    Some((id, &MONSTERS[id]))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unit {
     pub id: UnitId,
@@ -169,6 +199,15 @@ pub struct Unit {
 pub enum Combatant {
     Unit(UnitId),
     Warden(Player),
+}
+
+impl Combatant {
+    pub fn name(self) -> String {
+        match self {
+            Self::Unit(id) => MONSTERS[id].0.to_owned(),
+            Self::Warden(player) => format!("{} のウォーデン", player.name()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +400,11 @@ impl Game {
         self.turn_player
     }
 
+    /// 現在の手番のウォーデンが攻撃済みかを返す。
+    pub fn warden_attacked(&self) -> bool {
+        self.warden_attacked
+    }
+
     /// P1 の最初の手番を 1 とする手番番号。
     pub fn turn(&self) -> u16 {
         self.turn
@@ -460,7 +504,7 @@ impl Game {
             }
         }
         self.last_roll = Some(rolls);
-        self.log.push(format!("{player:?} rolled"));
+        self.log.push(format!("{} がダイスを振った", player.name()));
 
         self.phase = (1..=3)
             .find(|&level| {
@@ -473,15 +517,7 @@ impl Game {
 
     fn summon(&mut self, level: u8, pos: Pos) {
         let owner = self.turn_player;
-        let id = owner.index() * 3 + usize::from(level - 1);
-        let (name, hp, atk, def, ability) = [
-            ("Bramble Squire", 20, 10, 10, Ability::Swift),
-            ("Cinder Hound", 30, 20, 10, Ability::Tunnel),
-            ("Ash Colossus", 40, 30, 20, Ability::Wings),
-            ("Rime Sprite", 10, 10, 10, Ability::Flying),
-            ("Glacier Duelist", 30, 20, 10, Ability::TwinStrike),
-            ("Frost Leviathan", 40, 30, 20, Ability::Ward),
-        ][id];
+        let (id, &(name, level, hp, atk, def, ability)) = monster(owner, level).unwrap();
         self.summoned[owner.index()] |= 1 << (level - 1);
         self.units.push(Unit {
             id,
@@ -498,10 +534,10 @@ impl Game {
             moved: false,
             attacked: false,
         });
-        self.log.push(format!("{owner:?} summoned {name}"));
+        self.log.push(format!("{} が {name} を召喚", owner.name()));
     }
 
-    fn move_unit(&mut self, id: UnitId, to: Pos) -> Result<(), RuleError> {
+    fn move_unit(&mut self, id: UnitId, to @ (x, y): Pos) -> Result<(), RuleError> {
         let (_, cost) = self
             .reachable(id)
             .into_iter()
@@ -511,7 +547,7 @@ impl Game {
         unit.pos = to;
         unit.moved = true;
         self.runes[self.turn_player.index()].movement -= cost;
-        self.log.push(format!("{} moved to {to:?}", unit.name));
+        self.log.push(format!("{} が ({x}, {y}) へ移動", unit.name));
         Ok(())
     }
 
@@ -527,13 +563,10 @@ impl Game {
         if !self.can_use_wings(id) {
             return Err(RuleError::InvalidAbility);
         }
-        self.units
-            .iter_mut()
-            .find(|unit| unit.id == id)
-            .unwrap()
-            .flying = true;
+        let unit = self.units.iter_mut().find(|unit| unit.id == id).unwrap();
+        unit.flying = true;
         self.runes[self.turn_player.index()].magic -= 1;
-        self.log.push("Ash Colossus gained Flying".into());
+        self.log.push(format!("{} が飛行を得た", unit.name));
         Ok(())
     }
 
@@ -615,18 +648,19 @@ impl Game {
             }
             Combatant::Warden(_) => self.warden_attacked = true,
         }
+        self.log
+            .push(format!("{} が {} を攻撃", attacker.name(), target.name()));
         match target {
             Combatant::Warden(player) => {
                 let lp = &mut self.lp[player.index()];
                 *lp = lp.saturating_sub(hits);
-                self.log.push(format!("{player:?} Warden has {lp} LP"));
+                self.log
+                    .push(format!("{} のウォーデンが被弾 (LP {lp})", player.name()));
                 if *lp == 0 {
                     self.finish(Outcome::Win(self.turn_player));
                 }
             }
             Combatant::Unit(target) => {
-                let name = self.unit(target).unwrap().name;
-                self.log.push(format!("{attacker:?} attacked {name}"));
                 self.phase = Phase::AwaitDefense {
                     attacker,
                     target,
@@ -666,7 +700,7 @@ impl Game {
         }
         let atk = match attacker {
             Combatant::Unit(id) => self.unit(id).unwrap().atk,
-            Combatant::Warden(_) => 10,
+            Combatant::Warden(_) => WARDEN_ATK,
         };
         let def = self.unit(target).unwrap().def;
         Some(match choice {
@@ -692,16 +726,22 @@ impl Game {
             .find(|unit| unit.id == target)
             .unwrap();
         let pool = &mut self.runes[unit.owner.index()];
-        match choice {
-            DefenseChoice::None => {}
-            DefenseChoice::Guard => pool.guard -= 1,
-            DefenseChoice::Ward => pool.trap -= 1,
-        }
+        let defense = match choice {
+            DefenseChoice::None => "防御なし",
+            DefenseChoice::Guard => {
+                pool.guard -= 1;
+                "守護"
+            }
+            DefenseChoice::Ward => {
+                pool.trap -= 1;
+                "Ward"
+            }
+        };
         unit.hp = unit.hp.saturating_sub(damage);
         self.log
-            .push(format!("{} took {damage} damage ({choice:?})", unit.name));
+            .push(format!("{} は {defense} で {damage} ダメージ", unit.name));
         if unit.hp == 0 {
-            self.log.push(format!("{} was defeated", unit.name));
+            self.log.push(format!("{} を撃破", unit.name));
             self.units.retain(|unit| unit.id != target);
             self.phase = Phase::Action;
             self.check_stalemate();
@@ -769,6 +809,9 @@ impl Game {
 
     fn finish(&mut self, outcome: Outcome) {
         self.phase = Phase::Finished(outcome);
-        self.log.push(format!("Game over: {outcome:?}"));
+        self.log.push(match outcome {
+            Outcome::Win(player) => format!("対局終了：{} の勝ち", player.name()),
+            Outcome::Draw => "対局終了：引き分け".to_owned(),
+        });
     }
 }

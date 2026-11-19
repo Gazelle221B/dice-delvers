@@ -2,8 +2,8 @@
 //! ルール判定は持たず、`delvers-core` のクエリ (`reachable` / `attack_targets` / `is_legal_placement` など) に任せる。
 
 use delvers_core::{
-    Ability, Action, Cell, Combatant, DICE_FACES, DefenseChoice, Face, Game, Outcome, Phase,
-    Placement, Player, Pos, Rune, ai, placement_cells,
+    Ability, Action, Cell, Combatant, DICE_FACES, DefenseChoice, Face, Game, MONSTERS, Outcome,
+    Phase, Placement, Player, Pos, Rune, WARDEN_ATK, ai, monster, placement_cells,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, vec2};
 
@@ -61,28 +61,10 @@ fn seed() -> u64 {
 
 fn p_color(p: Player) -> Color32 {
     match p {
-        Player::P1 => Color32::from_rgb(70, 140, 240),
-        Player::P2 => Color32::from_rgb(240, 100, 80),
+        Player::P1 => Color32::from_rgb(240, 100, 80),
+        Player::P2 => Color32::from_rgb(70, 140, 240),
     }
 }
-
-fn p_name(p: Player) -> &'static str {
-    match p {
-        Player::P1 => "P1 Ember",
-        Player::P2 => "P2 Frost",
-    }
-}
-
-/// ユニット ID = 陣営 * 3 + (レベル - 1) の順。(名前, HP, ATK, DEF, 能力)
-/// ponytail: core の召喚テーブルは非公開なので複製している。core が公開したらそちらを使う。
-const MONSTERS: [(&str, u8, u8, u8, Ability); 6] = [
-    ("Bramble Squire", 20, 10, 10, Ability::Swift),
-    ("Cinder Hound", 30, 20, 10, Ability::Tunnel),
-    ("Ash Colossus", 40, 30, 20, Ability::Wings),
-    ("Rime Sprite", 10, 10, 10, Ability::Flying),
-    ("Glacier Duelist", 30, 20, 10, Ability::TwinStrike),
-    ("Frost Leviathan", 40, 30, 20, Ability::Ward),
-];
 
 fn ability_text(a: Ability) -> &'static str {
     match a {
@@ -145,85 +127,6 @@ fn comb_pos(g: &Game, c: Combatant) -> Option<Pos> {
         Combatant::Unit(id) => g.unit(id).map(|u| u.pos),
         Combatant::Warden(p) => Some(p.domain()),
     }
-}
-
-fn comb_name(c: Combatant) -> String {
-    match c {
-        Combatant::Unit(id) => MONSTERS[id].0.to_owned(),
-        Combatant::Warden(p) => format!("{} のウォーデン", p_name(p)),
-    }
-}
-
-/// core のログ (英語) を日本語化する。想定外の形式はそのまま返す。
-fn ja_log(s: &str) -> String {
-    let player = |t: &str| match t {
-        "P1" => Some(p_name(Player::P1)),
-        "P2" => Some(p_name(Player::P2)),
-        _ => None,
-    };
-    let unit = |t: &str| MONSTERS.iter().find(|m| m.0 == t).map(|m| m.0);
-    if let Some(p) = s.strip_suffix(" rolled").and_then(player) {
-        return format!("{p} がダイスを振った");
-    }
-    if let Some((p, n)) = s.split_once(" summoned ")
-        && let Some(p) = player(p)
-    {
-        return format!("{p} が {n} を召喚");
-    }
-    if let Some((n, to)) = s.split_once(" moved to ") {
-        return format!("{n} が {to} へ移動");
-    }
-    if let Some(n) = s.strip_suffix(" gained Flying") {
-        return format!("{n} が飛行を得た");
-    }
-    if let Some((a, n)) = s.split_once(" attacked ") {
-        let a = if let Some(id) = a
-            .strip_prefix("Unit(")
-            .and_then(|r| r.strip_suffix(')'))
-            .and_then(|r| r.parse::<usize>().ok())
-        {
-            MONSTERS.get(id).map_or(a.to_owned(), |m| m.0.to_owned())
-        } else if let Some(p) = a
-            .strip_prefix("Warden(")
-            .and_then(|r| r.strip_suffix(')'))
-            .and_then(player)
-        {
-            format!("{p} のウォーデン")
-        } else {
-            a.to_owned()
-        };
-        return format!("{a} が {n} を攻撃");
-    }
-    if let Some((p, lp)) = s.split_once(" Warden has ")
-        && let (Some(p), Some(lp)) = (player(p), lp.strip_suffix(" LP"))
-    {
-        return format!("{p} のウォーデンが被弾 (LP {lp})");
-    }
-    if let Some((n, rest)) = s.split_once(" took ")
-        && unit(n).is_some()
-        && let Some((d, how)) = rest.split_once(" damage (")
-    {
-        let how = match how.trim_end_matches(')') {
-            "Guard" => "守護",
-            "Ward" => "Ward",
-            _ => "防御なし",
-        };
-        return format!("{n} は {how} で {d} ダメージ");
-    }
-    if let Some(n) = s.strip_suffix(" was defeated") {
-        return format!("{n} を撃破");
-    }
-    if let Some(r) = s.strip_prefix("Game over: ") {
-        return match r
-            .strip_prefix("Win(")
-            .and_then(|r| r.strip_suffix(')'))
-            .and_then(player)
-        {
-            Some(p) => format!("対局終了: {p} の勝ち"),
-            None => "対局終了: 引き分け".to_owned(),
-        };
-    }
-    s.to_owned()
 }
 
 // ---- 画面 ----
@@ -329,7 +232,7 @@ impl Play {
 
         if let Some(outcome) = self.game.outcome() {
             let text = match outcome {
-                Outcome::Win(p) => format!("{} の勝ち！", p_name(p)),
+                Outcome::Win(p) => format!("{} の勝ち！", p.name()),
                 Outcome::Draw => "引き分け".to_owned(),
             };
             egui::Window::new("対局終了")
@@ -684,7 +587,7 @@ impl Play {
             let active = g.to_act() == Some(p);
             ui.separator();
             ui.horizontal(|ui| {
-                let t = egui::RichText::new(format!("{}{who}", p_name(p)))
+                let t = egui::RichText::new(format!("{}{who}", p.name()))
                     .color(p_color(p))
                     .strong();
                 ui.label(t);
@@ -699,8 +602,7 @@ impl Play {
                 r.movement, r.attack, r.guard, r.magic, r.trap
             ));
             for lv in 1..=3u8 {
-                let id = p.index() * 3 + usize::from(lv - 1);
-                let (name, hp, atk, def, ab) = MONSTERS[id];
+                let (id, &(name, lv, hp, atk, def, ab)) = monster(p, lv).unwrap();
                 let state = match g.unit(id) {
                     Some(u) => format!("場に出ている HP {}/{}", u.hp, u.max_hp),
                     None if g.has_summoned(p, lv) => "撃破".to_owned(),
@@ -717,7 +619,7 @@ impl Play {
             .auto_shrink(false)
             .show(ui, |ui| {
                 for l in g.log() {
-                    ui.label(ja_log(l));
+                    ui.label(l);
                 }
             });
         back
@@ -731,7 +633,7 @@ impl Play {
         ui.horizontal_wrapped(|ui| {
             if let Some(p) = g.to_act() {
                 ui.label(
-                    egui::RichText::new(format!("手番: {}", p_name(g.turn_player())))
+                    egui::RichText::new(format!("手番: {}", g.turn_player().name()))
                         .color(p_color(g.turn_player()))
                         .strong(),
                 );
@@ -826,7 +728,7 @@ impl Play {
     }
 
     fn place_ui(&mut self, ui: &mut egui::Ui, level: u8) {
-        let name = MONSTERS[self.game.turn_player().index() * 3 + usize::from(level - 1)].0;
+        let name = monster(self.game.turn_player(), level).unwrap().1.0;
         ui.label(format!(
             "Lv{level} {name} を召喚: 形を選び、盤面でタイルを置く場所をクリック (金枠 = 召喚マス)"
         ));
@@ -854,7 +756,15 @@ impl Play {
         let mut twin_toggle = false;
         ui.horizontal(|ui| {
             match self.sel.unit {
-                Some(c) => ui.label(format!("選択中: {}", comb_name(c))),
+                Some(c @ Combatant::Warden(_)) => {
+                    let status = if g.warden_attacked() {
+                        " 攻撃済み"
+                    } else {
+                        ""
+                    };
+                    ui.label(format!("選択中: {} ATK {WARDEN_ATK}{status}", c.name()))
+                }
+                Some(c) => ui.label(format!("選択中: {}", c.name())),
                 None => ui.label("自分のユニットかウォーデンをクリックして選択"),
             };
             if let Some(Combatant::Unit(id)) = self.sel.unit {
@@ -900,7 +810,7 @@ impl Play {
         let g = &self.game;
         ui.label(format!(
             "{} が {} を攻撃！ (残り {hits_left} 撃) 防御を選んでください:",
-            comb_name(attacker),
+            attacker.name(),
             MONSTERS[target].0
         ));
         let mut act = None;
