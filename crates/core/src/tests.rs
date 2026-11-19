@@ -398,13 +398,57 @@ fn warden_hit_is_immediate_and_zero_lp_ends_game() {
     let mut game = corridor(P2);
     game.summon(2, (1, 5));
     game.runes[1].attack = 2;
+    // 能力はウォーデンに作用しない
+    assert_rejected(
+        &mut game,
+        Action::TwinStrike {
+            attacker: 4,
+            target: Warden(P1),
+        },
+        RuleError::InvalidAttack,
+    );
+    assert_eq!(game.lp(P1), 3);
+}
+
+#[test]
+fn twin_strike_ends_when_first_hit_destroys_target() {
+    let mut game = corridor(P2);
+    game.summon(2, (6, 5));
+    game.turn_player = P1;
+    game.summon(1, (5, 5)); // Bramble Squire HP20
+    game.turn_player = P2;
+    game.runes[1].attack = 2;
+    let target = game.unit_at((5, 5)).unwrap().id;
     game.apply(Action::TwinStrike {
         attacker: 4,
-        target: Warden(P1),
+        target: Creature(target),
     })
     .unwrap();
-    assert_eq!(game.lp(P1), 1);
+    game.apply(Action::Defend(DefenseChoice::None)).unwrap();
+    assert!(game.unit(target).is_none());
     assert_eq!(game.phase(), Phase::Action);
+    assert_eq!(game.to_act(), Some(P2));
+}
+
+#[test]
+fn guard_clamps_damage_at_zero() {
+    let mut game = corridor(P1);
+    game.summon(1, (6, 5)); // Bramble Squire ATK10
+    game.turn_player = P2;
+    game.summon(3, (7, 5)); // Frost Leviathan DEF20
+    game.turn_player = P1;
+    game.runes[0].attack = 1;
+    game.runes[1].guard = 1;
+    let target = game.unit_at((7, 5)).unwrap().id;
+    let attacker = game.unit_at((6, 5)).unwrap().id;
+    game.apply(Action::Attack {
+        attacker: Creature(attacker),
+        target: Creature(target),
+    })
+    .unwrap();
+    assert_eq!(game.pending_damage(DefenseChoice::Guard), Some(0));
+    game.apply(Action::Defend(DefenseChoice::Guard)).unwrap();
+    assert_eq!(game.unit(target).unwrap().hp, 40);
 }
 
 #[test]
