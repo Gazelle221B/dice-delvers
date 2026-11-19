@@ -1,7 +1,8 @@
 //! その局面で実行できる行動を一手ずつ選ぶ CPU。
 
 use crate::{
-    Ability, Action, Combatant, DefenseChoice, Game, Phase, Player, Pos, board::neighbors,
+    Ability, Action, Combatant, DefenseChoice, Game, Phase, Player, Pos, WARDEN_ATK,
+    board::neighbors,
 };
 
 /// game.to_act() が CPU を返す局面で呼ぶ。終局後に呼ぶとパニックする。
@@ -115,7 +116,7 @@ fn attack_score(game: &Game, attacker: Combatant, target: Combatant, hits: u8) -
         Combatant::Unit(id) => {
             let unit = game.unit(id).unwrap();
             let atk = match attacker {
-                Combatant::Warden(_) => 10,
+                Combatant::Warden(_) => WARDEN_ATK,
                 Combatant::Unit(id) => game.unit(id).unwrap().atk,
             };
             let pool = game.runes(unit.owner);

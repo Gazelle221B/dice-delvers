@@ -25,8 +25,8 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
 
 const COLS: u32 = 13u;
 const ROWS: u32 = 11u;
-const P1: vec3<f32> = vec3<f32>(0.25, 0.55, 0.95);
-const P2: vec3<f32> = vec3<f32>(0.95, 0.40, 0.30);
+const P1: vec3<f32> = vec3<f32>(0.95, 0.40, 0.30);
+const P2: vec3<f32> = vec3<f32>(0.25, 0.55, 0.95);
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {

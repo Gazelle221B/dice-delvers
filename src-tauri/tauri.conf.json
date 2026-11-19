@@ -13,7 +13,7 @@
     "windows": [
       { "title": "Dice Delvers", "width": 1280, "height": 800, "resizable": true }
     ],
-    "security": { "csp": null }
+    "security": { "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'" }
   },
   "bundle": {
     "active": true,
