@@ -707,3 +707,92 @@ fn logging_does_not_change_random_play() {
     assert_eq!(logged.board(), quiet.board());
     assert_eq!(logged.units(), quiet.units());
 }
+
+/// ゴールデンテスト用の対局生成。ルールエンジンの API 変更時はここだけを追従させる。
+fn golden_game(seed: u64, factions: [&str; 2]) -> Game {
+    let faction = |name| match name {
+        "Ember" => Faction::Ember,
+        "Frost" => Faction::Frost,
+        _ => unreachable!(),
+    };
+    Game::with_factions(seed, factions.map(faction))
+}
+
+/// Rust のバージョンに依存しない FNV-1a 64bit。
+fn fnv1a(hash: &mut u64, text: &str) {
+    for byte in text.bytes().chain([0xff]) {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+}
+
+/// 固定シードで最後まで対局し、行動列・出目・ログ・終局状態のハッシュを既知値と比べる。
+/// 既知値はルールセットのデータ化前のコードで計算した。挙動を意図して変えたとき以外は更新しない。
+#[test]
+fn golden_games_match_known_hashes() {
+    let mut results = Vec::new();
+    for factions in [
+        ["Ember", "Frost"],
+        ["Frost", "Ember"],
+        ["Ember", "Ember"],
+        ["Frost", "Frost"],
+    ] {
+        for random in [[false, false], [true, false], [false, true], [true, true]] {
+            let mut hash = 0xcbf2_9ce4_8422_2325;
+            for seed in 0..6 {
+                let mut game = golden_game(seed, factions);
+                let mut rng = fastrand::Rng::with_seed(!seed);
+                while let Some(actor) = game.to_act() {
+                    let action = if random[actor.index()] {
+                        ai::choose_random(&game, &mut rng)
+                    } else {
+                        ai::choose(&game)
+                    };
+                    fnv1a(&mut hash, &format!("{action:?}"));
+                    game.apply(action).unwrap();
+                    if matches!(action, Action::Roll { .. }) {
+                        fnv1a(&mut hash, &format!("{:?}", game.last_roll()));
+                    }
+                }
+                fnv1a(
+                    &mut hash,
+                    &format!(
+                        "{:?} {:?} {} {} {} {:?} {:?} {:?} {:?}",
+                        game.outcome(),
+                        game.end_reason(),
+                        game.turn(),
+                        game.lp(P1),
+                        game.lp(P2),
+                        game.runes(P1),
+                        game.runes(P2),
+                        game.units(),
+                        game.board(),
+                    ),
+                );
+                for line in game.log() {
+                    fnv1a(&mut hash, line);
+                }
+            }
+            results.push(format!("{factions:?} {random:?} {hash:016x}"));
+        }
+    }
+    let expected = [
+        "[\"Ember\", \"Frost\"] [false, false] fe19ff74c4cec7db",
+        "[\"Ember\", \"Frost\"] [true, false] 29a14a958a1634dd",
+        "[\"Ember\", \"Frost\"] [false, true] 65b8fb3412a2051e",
+        "[\"Ember\", \"Frost\"] [true, true] 884f9da22c790fa8",
+        "[\"Frost\", \"Ember\"] [false, false] 6590605e0fa6e030",
+        "[\"Frost\", \"Ember\"] [true, false] 89f5ca99bec74173",
+        "[\"Frost\", \"Ember\"] [false, true] e7afefe358f1baad",
+        "[\"Frost\", \"Ember\"] [true, true] 167d9fa330bed5ed",
+        "[\"Ember\", \"Ember\"] [false, false] 41d2680950e48792",
+        "[\"Ember\", \"Ember\"] [true, false] 7355861076eff5a2",
+        "[\"Ember\", \"Ember\"] [false, true] 214849077c298cfe",
+        "[\"Ember\", \"Ember\"] [true, true] cd63300eae0f5c6b",
+        "[\"Frost\", \"Frost\"] [false, false] 6b098e6a81fa7688",
+        "[\"Frost\", \"Frost\"] [true, false] 3e24079361a9d7c9",
+        "[\"Frost\", \"Frost\"] [false, true] 3b20f3f3836535a2",
+        "[\"Frost\", \"Frost\"] [true, true] 05b02c216e85cab7",
+    ];
+    assert_eq!(results, expected, "\n{}", results.join("\n"));
+}
