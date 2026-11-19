@@ -136,3 +136,9 @@ fn attack_score(game: &Game, attacker: Combatant, target: Combatant, hits: u8) -
 fn distance(a: Pos, b: Pos) -> usize {
     a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
 }
+
+/// 終局前の全合法手から、呼び出し側の乱数で一様に一手選ぶ。
+pub fn choose_random(game: &Game, rng: &mut fastrand::Rng) -> Action {
+    let actions = game.legal_actions();
+    actions[rng.usize(..actions.len())]
+}

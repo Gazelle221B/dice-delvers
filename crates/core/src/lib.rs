@@ -255,6 +255,13 @@ pub enum Outcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    LpZero,
+    Stalemate,
+    TurnLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Roll,
     Place {
@@ -369,6 +376,8 @@ pub struct Game {
     phase: Phase,
     last_roll: Option<[DieRoll; 3]>,
     log: Vec<String>,
+    logging: bool,
+    end_reason: Option<EndReason>,
 }
 
 impl Game {
@@ -396,6 +405,8 @@ impl Game {
             phase: Phase::Roll,
             last_roll: None,
             log: Vec::new(),
+            logging: true,
+            end_reason: None,
         }
     }
 
@@ -470,6 +481,10 @@ impl Game {
         }
     }
 
+    pub fn end_reason(&self) -> Option<EndReason> {
+        self.end_reason
+    }
+
     /// 次の操作を行う側。終局では None。
     pub fn to_act(&self) -> Option<Player> {
         match self.phase {
@@ -485,6 +500,68 @@ impl Game {
 
     pub fn log(&self) -> &[String] {
         &self.log
+    }
+
+    /// 以降のログ生成を切り替える。
+    pub fn set_logging(&mut self, enabled: bool) {
+        self.logging = enabled;
+    }
+
+    /// 生じる結果が同じでも、引数の異なる手は別々に返す。
+    pub fn legal_actions(&self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        match self.phase {
+            Phase::Roll => {
+                for a in 1..=4 {
+                    for b in 1..=4 {
+                        for c in 1..=4 {
+                            actions.push(Action::Roll { dice: [a, b, c] });
+                        }
+                    }
+                }
+            }
+            Phase::Place { .. } => {
+                actions.extend(self.legal_placements().into_iter().map(Action::from))
+            }
+            Phase::Action => {
+                let add_attacks = |actions: &mut Vec<_>, attacker| {
+                    actions.extend(
+                        self.attack_targets(attacker)
+                            .into_iter()
+                            .map(|target| Action::Attack { attacker, target }),
+                    );
+                };
+                add_attacks(&mut actions, Combatant::Warden(self.turn_player));
+                for unit in self
+                    .units
+                    .iter()
+                    .filter(|u| u.owner == self.turn_player)
+                    .map(|u| u.id)
+                {
+                    add_attacks(&mut actions, Combatant::Unit(unit));
+                    actions.extend(self.twin_strike_targets(unit).into_iter().map(|target| {
+                        Action::TwinStrike {
+                            attacker: unit,
+                            target,
+                        }
+                    }));
+                    actions.extend(
+                        self.reachable(unit)
+                            .into_iter()
+                            .map(|(to, _)| Action::Move { unit, to }),
+                    );
+                    if self.can_use_wings(unit) {
+                        actions.push(Action::Wings { unit });
+                    }
+                }
+                actions.push(Action::EndTurn);
+            }
+            Phase::AwaitDefense { .. } => {
+                actions.extend(self.defense_choices().into_iter().map(Action::Defend))
+            }
+            Phase::Finished(_) => {}
+        }
+        actions
     }
 
     /// 合法手を適用する。Err の場合は乱数状態も含めて変更しない。
@@ -553,10 +630,12 @@ impl Game {
             }
         }
         self.last_roll = Some(rolls);
-        self.log.push(format!(
-            "{} がダイスを振った",
-            player.name_with(self.factions)
-        ));
+        if self.logging {
+            self.log.push(format!(
+                "{} がダイスを振った",
+                player.name_with(self.factions)
+            ));
+        }
 
         self.phase = (1..=3)
             .find(|&level| {
@@ -586,10 +665,12 @@ impl Game {
             moved: false,
             attacked: false,
         });
-        self.log.push(format!(
-            "{} が {name} を召喚",
-            owner.name_with(self.factions)
-        ));
+        if self.logging {
+            self.log.push(format!(
+                "{} が {name} を召喚",
+                owner.name_with(self.factions)
+            ));
+        }
     }
 
     fn move_unit(&mut self, id: UnitId, to @ (x, y): Pos) -> Result<(), RuleError> {
@@ -602,7 +683,9 @@ impl Game {
         unit.pos = to;
         unit.moved = true;
         self.runes[self.turn_player.index()].movement -= cost;
-        self.log.push(format!("{} が ({x}, {y}) へ移動", unit.name));
+        if self.logging {
+            self.log.push(format!("{} が ({x}, {y}) へ移動", unit.name));
+        }
         Ok(())
     }
 
@@ -621,7 +704,9 @@ impl Game {
         let unit = self.units.iter_mut().find(|unit| unit.id == id).unwrap();
         unit.flying = true;
         self.runes[self.turn_player.index()].magic -= 1;
-        self.log.push(format!("{} が飛行を得た", unit.name));
+        if self.logging {
+            self.log.push(format!("{} が飛行を得た", unit.name));
+        }
         Ok(())
     }
 
@@ -703,21 +788,25 @@ impl Game {
             }
             Combatant::Warden(_) => self.warden_attacked = true,
         }
-        self.log.push(format!(
-            "{} が {} を攻撃",
-            attacker.name_with(self.factions),
-            target.name_with(self.factions)
-        ));
+        if self.logging {
+            self.log.push(format!(
+                "{} が {} を攻撃",
+                attacker.name_with(self.factions),
+                target.name_with(self.factions)
+            ));
+        }
         match target {
             Combatant::Warden(player) => {
                 let lp = &mut self.lp[player.index()];
                 *lp = lp.saturating_sub(hits);
-                self.log.push(format!(
-                    "{} のウォーデンが被弾 (LP {lp})",
-                    player.name_with(self.factions)
-                ));
+                if self.logging {
+                    self.log.push(format!(
+                        "{} のウォーデンが被弾 (LP {lp})",
+                        player.name_with(self.factions)
+                    ));
+                }
                 if *lp == 0 {
-                    self.finish(Outcome::Win(self.turn_player));
+                    self.finish(Outcome::Win(self.turn_player), EndReason::LpZero);
                 }
             }
             Combatant::Unit(target) => {
@@ -798,10 +887,14 @@ impl Game {
             }
         };
         unit.hp = unit.hp.saturating_sub(damage);
-        self.log
-            .push(format!("{} は {defense} で {damage} ダメージ", unit.name));
+        if self.logging {
+            self.log
+                .push(format!("{} は {defense} で {damage} ダメージ", unit.name));
+        }
         if unit.hp == 0 {
-            self.log.push(format!("{} を撃破", unit.name));
+            if self.logging {
+                self.log.push(format!("{} を撃破", unit.name));
+            }
             self.units.retain(|unit| unit.id != target);
             self.phase = Phase::Action;
             self.check_stalemate();
@@ -819,7 +912,7 @@ impl Game {
 
     fn end_turn(&mut self) {
         if self.turn == 300 {
-            self.finish_by_score();
+            self.finish_by_score(EndReason::TurnLimit);
         } else {
             self.check_stalemate();
             if self.outcome().is_some() {
@@ -843,7 +936,7 @@ impl Game {
                     || self.placements(player).next().is_none()
             })
         {
-            self.finish_by_score();
+            self.finish_by_score(EndReason::Stalemate);
         }
     }
 
@@ -858,20 +951,28 @@ impl Game {
         )
     }
 
-    fn finish_by_score(&mut self) {
+    fn finish_by_score(&mut self, reason: EndReason) {
         use std::cmp::Ordering;
-        self.finish(match self.score(Player::P1).cmp(&self.score(Player::P2)) {
-            Ordering::Greater => Outcome::Win(Player::P1),
-            Ordering::Less => Outcome::Win(Player::P2),
-            Ordering::Equal => Outcome::Draw,
-        });
+        self.finish(
+            match self.score(Player::P1).cmp(&self.score(Player::P2)) {
+                Ordering::Greater => Outcome::Win(Player::P1),
+                Ordering::Less => Outcome::Win(Player::P2),
+                Ordering::Equal => Outcome::Draw,
+            },
+            reason,
+        );
     }
 
-    fn finish(&mut self, outcome: Outcome) {
+    fn finish(&mut self, outcome: Outcome, reason: EndReason) {
+        self.end_reason = Some(reason);
         self.phase = Phase::Finished(outcome);
-        self.log.push(match outcome {
-            Outcome::Win(player) => format!("対局終了：{} の勝ち", player.name_with(self.factions)),
-            Outcome::Draw => "対局終了：引き分け".to_owned(),
-        });
+        if self.logging {
+            self.log.push(match outcome {
+                Outcome::Win(player) => {
+                    format!("対局終了：{} の勝ち", player.name_with(self.factions))
+                }
+                Outcome::Draw => "対局終了：引き分け".to_owned(),
+            });
+        }
     }
 }
