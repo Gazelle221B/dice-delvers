@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, env, ops::Range, process::ExitCode, sync::Arc};
 
 use delvers_core::{Action, Combatant, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
 
-const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random|tactical> <greedy|random|tactical> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool]";
+const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random|tactical> <greedy|random|tactical> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool|p2-move|opening-two|reroll|lp5]";
 
 #[derive(Debug, Clone, Copy)]
 enum Policy {
@@ -157,7 +157,12 @@ impl Stats {
                     active = true;
                 }
                 Action::Move { .. } => active = true,
-                Action::Roll { .. } | Action::RollPool { .. } => {
+                Action::Roll { .. }
+                | Action::RollPool { .. }
+                | Action::KeepRoll
+                | Action::Reroll { .. }
+                    if game.phase() != delvers_core::Phase::AwaitReroll =>
+                {
                     if game
                         .last_roll()
                         .unwrap()
@@ -317,7 +322,7 @@ fn run() -> Result<(), String> {
     let rules = Arc::new(match args.get(4).map(String::as_str).unwrap_or("basic") {
         "basic" => Ruleset::basic(),
         "pool" => Ruleset::pool(),
-        x => return Err(format!("未知のルールセット: {x}")),
+        x => Ruleset::experiment(x).ok_or_else(|| format!("未知のルールセット: {x}"))?,
     });
     let pairing = args.get(3).map(String::as_str).unwrap_or("ember-frost");
     let seats = pairing
@@ -326,7 +331,7 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| format!("未知の陣営設定: {pairing}"))?;
     let names = seats.map(|seat| rules.factions[seat].name);
     if rules.personal_pool {
-        print!("pool　");
+        print!("{}　", rules.name);
     }
     println!(
         "シード {range:?}　方策 {policies:?}　陣営 [{}]",

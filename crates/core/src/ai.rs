@@ -8,6 +8,7 @@ pub fn choose(game: &Game) -> Action {
     let enemy_domain = game.domain(player.opponent());
     match game.phase() {
         Phase::Roll if game.rules().personal_pool => pool_roll(game),
+        Phase::AwaitReroll => choose_reroll(game),
         Phase::ChooseSummon => game
             .legal_actions()
             .into_iter()
@@ -281,7 +282,7 @@ pub fn tactical(game: &Game, rng: &mut fastrand::Rng) -> Action {
                 candidates.push(Action::RollPool { dice });
             }
         }
-        Phase::ChooseSummon => candidates.extend(game.legal_actions()),
+        Phase::AwaitReroll | Phase::ChooseSummon => candidates.extend(game.legal_actions()),
         Phase::Action => {
             let mut advance = None;
             let mut intercept = None;
@@ -416,4 +417,65 @@ fn position_score(game: &Game, p: Player) -> i32 {
         + pressure * 3
         + threats * 45
         + units.map(|u| 10 + i32::from(u.hp) / 5).sum::<i32>()
+}
+
+/// 観測済みの出目を維持する価値と、各ダイスの全6面の平均価値を比べる。
+fn choose_reroll(game: &Game) -> Action {
+    use crate::{Face, Rune};
+    let player = game.turn_player();
+    let rolls = game.last_roll().unwrap();
+    let can_place = game.placements(player).next().is_some();
+    let summon = if game.units().iter().any(|u| u.owner == player) {
+        16
+    } else {
+        48
+    };
+    let value = |rolls: &[crate::DieRoll]| {
+        let mut pool = game.runes(player);
+        let mut score = 0i32;
+        let mut levels = Vec::new();
+        let mut pair = false;
+        for roll in rolls {
+            match roll.face {
+                Face::Summon(lv) if lv == roll.level => {
+                    pair |= levels.contains(&lv) && game.summonable(player, lv).is_some();
+                    levels.push(lv);
+                }
+                Face::Rune(r, n) => {
+                    let stock = game.runes(player).get(r);
+                    let weight = match r {
+                        Rune::Move | Rune::Attack if stock < 2 => 12,
+                        Rune::Move | Rune::Attack => 4,
+                        _ if stock == 0 => 4,
+                        _ => 1,
+                    };
+                    let amount = pool.amount_mut(r);
+                    let gain = n.min(game.rules().rune_cap - *amount);
+                    *amount += gain;
+                    score += weight * i32::from(gain);
+                }
+                _ => {}
+            }
+        }
+        score + if can_place && pair { summon } else { 0 }
+    };
+    let mut best = Action::KeepRoll;
+    let mut high = value(rolls) * 6;
+    let mut trial = rolls.to_vec();
+    for (index, roll) in rolls.iter().enumerate() {
+        let score = game.rules().dice[usize::from(roll.level - 1)]
+            .faces
+            .iter()
+            .map(|&face| {
+                trial[index].face = face;
+                value(&trial)
+            })
+            .sum();
+        trial[index] = *roll;
+        if score > high {
+            high = score;
+            best = Action::Reroll { index };
+        }
+    }
+    best
 }
