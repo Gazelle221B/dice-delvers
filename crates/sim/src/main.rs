@@ -197,17 +197,6 @@ impl Stats {
             self.summons[0] as f64 / n as f64,
             self.summons[1] as f64 / n as f64
         );
-        if !personal_pool {
-            println!(
-                "未連結試合の攻撃宣言 {}　未連結かつ双方3体召喚・生存あり・上限 {}　召喚4が2面以上のロール {}　貪欲ロール例外 {}/{}",
-                self.attacks_disconnected,
-                self.exhausted_disconnected,
-                self.lv4_pairs,
-                self.greedy_roll_exceptions,
-                self.greedy_rolls
-            );
-            return;
-        }
         for (i, &wins) in self.wins.iter().enumerate() {
             let (lo, hi) = wilson(wins, n);
             println!(
@@ -218,11 +207,18 @@ impl Stats {
                 self.histogram[i]
             );
         }
-        println!(
-            "平均残りダイス 先手 {:.4}　後手 {:.4}",
-            self.remaining[0] as f64 / n as f64,
-            self.remaining[1] as f64 / n as f64
-        );
+        if personal_pool {
+            println!(
+                "平均残りダイス 先手 {:.4}　後手 {:.4}",
+                self.remaining[0] as f64 / n as f64,
+                self.remaining[1] as f64 / n as f64
+            );
+        } else {
+            println!(
+                "貪欲ロール例外 {}/{}",
+                self.greedy_roll_exceptions, self.greedy_rolls
+            );
+        }
         println!(
             "未連結試合の攻撃宣言 {}　未連結かつ双方ロスター全召喚・生存あり・上限 {}　召喚4が2面以上のロール {}　Lv4召喚 {}",
             self.attacks_disconnected,
@@ -302,6 +298,21 @@ mod tests {
         assert_eq!(seeds("4+2"), Ok(4..6));
         for invalid in ["0", "1..1", "2..1", "0+0", "-1+2", "18446744073709551615+1"] {
             assert!(seeds(invalid).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    #[test]
+    fn wilson_handles_extremes_and_balanced_samples() {
+        for (wins, lo, hi) in [
+            (0, 0., 0.001917),
+            (1000, 0.478108, 0.521892),
+            (2000, 0.998083, 1.),
+        ] {
+            let (left, right) = super::wilson(wins, 2000);
+            assert!((left - lo).abs() < 0.00001 && (right - hi).abs() < 0.00001);
         }
     }
 }

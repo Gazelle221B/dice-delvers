@@ -171,27 +171,84 @@ pub fn choose_random(game: &Game, rng: &mut fastrand::Rng) -> Action {
     actions.swap_remove(rng.usize(..actions.len()))
 }
 
-/// 配置できる間は揃えやすい低レベルを優先し、余った枠は攻撃・移動を得やすい Lv2 に回す。
+/// 同レベルのダイスはロール評価が等しい。各レベルの個数配分だけを比較する。
 fn pool_roll(game: &Game) -> Action {
+    use crate::{Face, Rune};
     let player = game.turn_player();
-    let mut available: Vec<_> = game
-        .unsummoned(player)
-        .map(|(id, m)| (id, m.level))
-        .collect();
-    let target = if game.can_roll_pair(player) && game.placements(player).next().is_some() {
-        available
-            .iter()
-            .map(|&(_, level)| level)
-            .filter(|&level| available.iter().filter(|&&(_, lv)| lv == level).count() >= 2)
-            .min()
+    let rules = game.rules();
+    let pool = game.runes(player);
+    let mut by_level = vec![Vec::new(); rules.dice.len()];
+    for (id, m) in game.unsummoned(player) {
+        by_level[usize::from(m.level - 1)].push(id);
+    }
+    let summon_value = if game.units().iter().any(|u| u.owner == player) {
+        4.0
     } else {
-        None
+        12.0
     };
-    available.sort_by_key(|&(id, level)| (Some(level) != target, level != 2, id));
-    let mut dice: Vec<_> = available
-        .into_iter()
-        .take(game.rules().dice_per_roll)
-        .map(|(id, _)| id)
+    let count = game.pool_roll_size();
+    // 各レベルについて n 個振ったときの「召喚面が 2 個未満」の確率とルーン期待値。
+    let mut values = Vec::new();
+    for (i, die) in rules.dice.iter().enumerate() {
+        let mut expected = 0.;
+        let mut p = 0.;
+        for &face in &die.faces {
+            match face {
+                Face::Summon(lv) if usize::from(lv) == i + 1 => p += 1. / 6.,
+                Face::Rune(r, n) => {
+                    let stock = pool.get(r);
+                    let weight = match r {
+                        Rune::Move | Rune::Attack if stock < 2 => 3.,
+                        Rune::Move | Rune::Attack => 1.,
+                        _ if stock == 0 => 1.,
+                        _ => 0.25,
+                    };
+                    expected += f64::from(n.min(rules.rune_cap - stock)) * weight / 6.;
+                }
+                _ => {}
+            }
+        }
+        let (mut zero, mut one) = (1., 0.);
+        let mut table = vec![(1., 0.)];
+        for n in 1..=count.min(by_level[i].len()) {
+            one = one * (1. - p) + zero * p;
+            zero *= 1. - p;
+            table.push((zero + one, expected * n as f64));
+        }
+        values.push(table);
+    }
+    fn search(
+        tables: &[Vec<(f64, f64)>],
+        left: usize,
+        miss: f64,
+        utility: f64,
+        counts: &mut Vec<usize>,
+        best: &mut (f64, Vec<usize>),
+    ) {
+        if let Some((table, rest)) = tables.split_first() {
+            for (n, &(fail, runes)) in table.iter().take(left + 1).enumerate() {
+                counts.push(n);
+                search(rest, left - n, miss * fail, utility + runes, counts, best);
+                counts.pop();
+            }
+        } else if left == 0 && utility - miss > best.0 {
+            *best = (utility - miss, counts.clone());
+        }
+    }
+    let can_place = game.can_roll_pair(player) && game.placements(player).next().is_some();
+    let mut best = (f64::NEG_INFINITY, Vec::new());
+    search(
+        &values,
+        count,
+        if can_place { summon_value } else { 0. },
+        0.,
+        &mut Vec::new(),
+        &mut best,
+    );
+    let mut dice: Vec<_> = by_level
+        .iter()
+        .zip(best.1)
+        .flat_map(|(ids, n)| ids[..n].iter().copied())
         .collect();
     dice.sort_unstable();
     Action::RollPool { dice }
