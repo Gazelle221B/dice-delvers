@@ -148,6 +148,7 @@ pub enum EndReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Roll,
+    AwaitReroll,
     ChooseSummon,
     Place {
         level: u8,
@@ -180,6 +181,10 @@ impl Placement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    KeepRoll,
+    Reroll {
+        index: usize,
+    },
     /// プール内の別々のダイスを ID 昇順で指定する。
     RollPool {
         dice: Vec<UnitId>,
@@ -271,6 +276,7 @@ pub struct Game {
     turn: u16,
     phase: Phase,
     last_roll: Option<Vec<DieRoll>>,
+    pending_dice: Vec<UnitId>,
     log: Vec<String>,
     logging: bool,
     summon_dice: Vec<UnitId>,
@@ -307,6 +313,21 @@ impl Game {
                 "プールに未定義レベルのダイスがある"
             );
         }
+        assert!(
+            rules
+                .initial_runes
+                .iter()
+                .all(|r| [r.movement, r.attack, r.guard, r.magic, r.trap]
+                    .into_iter()
+                    .all(|n| n <= rules.rune_cap)),
+            "初期ルーンが上限を超えている"
+        );
+        assert!(
+            rules
+                .opening_pool_roll
+                .is_none_or(|n| rules.personal_pool && (1..=rules.dice_per_roll).contains(&n)),
+            "初手のダイス数が不正"
+        );
         let mut board = vec![vec![Cell::Empty; rules.width]; rules.height];
         let units = seats
             .iter()
@@ -317,7 +338,7 @@ impl Game {
             rng: fastrand::Rng::with_seed(seed),
             board: Vec::new(),
             units: Vec::new(),
-            runes: [RunePool::default(); 2],
+            runes: rules.initial_runes,
             lp: [rules.lp; 2],
             summoned: vec![false; units],
             warden_attacked: false,
@@ -325,6 +346,7 @@ impl Game {
             turn: 1,
             phase: Phase::Roll,
             last_roll: None,
+            pending_dice: Vec::new(),
             log: Vec::new(),
             logging: true,
             summon_dice: Vec::new(),
@@ -498,8 +520,14 @@ impl Game {
                     .unsummoned(self.turn_player)
                     .map(|(id, _)| id)
                     .collect();
-                let count = ids.len().min(self.rules.dice_per_roll);
+                let count = self.pool_roll_size();
                 pool::combinations(&ids, count, &mut Vec::new(), &mut actions);
+            }
+            Phase::AwaitReroll => {
+                actions.push(Action::KeepRoll);
+                actions.extend(
+                    (0..self.last_roll().unwrap().len()).map(|index| Action::Reroll { index }),
+                );
             }
             Phase::ChooseSummon => actions.extend(
                 self.summon_dice
@@ -578,6 +606,8 @@ impl Game {
             (Phase::Roll, Action::RollPool { dice }) if self.rules.personal_pool => {
                 self.roll_pool(dice)
             }
+            (Phase::AwaitReroll, Action::KeepRoll) => self.confirm_roll(None),
+            (Phase::AwaitReroll, Action::Reroll { index }) => self.confirm_roll(Some(index)),
             (Phase::ChooseSummon, Action::ChooseSummon { die }) => self.choose_summon(die),
             (
                 Phase::Place { level },
@@ -647,6 +677,43 @@ impl Game {
                 }
             })
             .collect();
+        if self.logging {
+            self.log.push(format!(
+                "{} がダイスを振った",
+                self.player_name(self.turn_player)
+            ));
+        }
+        if self.rules.reroll_one && !rolls.is_empty() {
+            self.pending_dice = ids.to_vec();
+            self.last_roll = Some(rolls);
+            self.phase = Phase::AwaitReroll;
+        } else {
+            self.resolve_roll(rolls, ids);
+        }
+    }
+
+    pub fn pending_die(&self, index: usize) -> Option<UnitId> {
+        self.pending_dice.get(index).copied()
+    }
+
+    fn confirm_roll(&mut self, index: Option<usize>) -> Result<(), RuleError> {
+        if index.is_some_and(|i| i >= self.last_roll().unwrap().len()) {
+            return Err(RuleError::InvalidDice);
+        }
+        let mut rolls = self.last_roll.take().unwrap();
+        if let Some(i) = index {
+            let faces = &self.rules.dice[usize::from(rolls[i].level - 1)].faces;
+            rolls[i].face = faces[self.rng.usize(..faces.len())];
+            if self.logging {
+                self.log.push(format!("{} 個目を振り直した", i + 1));
+            }
+        }
+        let ids = std::mem::take(&mut self.pending_dice);
+        self.resolve_roll(rolls, &ids);
+        Ok(())
+    }
+
+    fn resolve_roll(&mut self, rolls: Vec<DieRoll>, ids: &[UnitId]) {
         let player = self.turn_player;
         let pool = &mut self.runes[player.index()];
         let mut summons = Vec::new();
@@ -675,10 +742,6 @@ impl Game {
                 .collect();
         }
         self.last_roll = Some(rolls);
-        if self.logging {
-            self.log
-                .push(format!("{} がダイスを振った", self.player_name(player)));
-        }
 
         if self.rules.personal_pool {
             self.phase = if !self.summon_dice.is_empty() && self.placements(player).next().is_some()

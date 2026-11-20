@@ -1137,3 +1137,105 @@ fn tactical_uses_only_public_position_and_policy_seed() {
     assert!(game.legal_actions().contains(&a));
     game.apply(a).unwrap();
 }
+
+#[test]
+fn experimental_presets_change_one_setting() {
+    for name in ["p2-move", "opening-two", "reroll", "lp5"] {
+        let actual = Ruleset::experiment(name).unwrap();
+        let mut expected = Ruleset::pool();
+        expected.name = actual.name;
+        match name {
+            "p2-move" => expected.initial_runes[1].movement = 1,
+            "opening-two" => expected.opening_pool_roll = Some(2),
+            "reroll" => expected.reroll_one = true,
+            "lp5" => expected.lp = 5,
+            _ => unreachable!(),
+        }
+        assert_eq!(actual, expected);
+        let g = Game::new(Arc::new(actual), [1, 1], 1);
+        assert_eq!(g.runes(P1), RunePool::default());
+        assert_eq!(g.runes(P2).movement, u8::from(name == "p2-move"));
+        assert_eq!(g.lp(P1), if name == "lp5" { 5 } else { 3 });
+    }
+}
+
+#[test]
+fn opening_two_applies_to_first_turn_only() {
+    let mut g = Game::new(
+        Arc::new(Ruleset::experiment("opening-two").unwrap()),
+        [0, 0],
+        1,
+    );
+    assert_eq!(g.legal_actions().len(), 105);
+    assert_rejected(
+        &mut g,
+        Action::RollPool {
+            dice: vec![0, 1, 2],
+        },
+        RuleError::InvalidDice,
+    );
+    g.apply(Action::RollPool { dice: vec![0, 5] }).unwrap();
+    g.apply(Action::EndTurn).unwrap();
+    assert_eq!(g.pool_roll_size(), 3);
+    g.apply(Action::RollPool {
+        dice: vec![15, 20, 25],
+    })
+    .unwrap();
+    g.apply(Action::EndTurn).unwrap();
+    assert_eq!(g.pool_roll_size(), 3);
+}
+
+#[test]
+fn reroll_commits_only_final_faces_and_never_spends_twice() {
+    let mut rules = Ruleset::experiment("reroll").unwrap();
+    rules.dice[0].faces = [Face::Rune(Rune::Move, 2); 6];
+    rules.dice[0].faces[0] = Face::Summon(1);
+    let seed = (0..)
+        .find(|&seed| {
+            let mut r = fastrand::Rng::with_seed(seed);
+            r.usize(..6) == 0 && r.usize(..6) == 0 && r.usize(..6) != 0 && r.usize(..6) != 0
+        })
+        .unwrap();
+    let mut g = Game::new(Arc::new(rules), [0, 0], seed);
+    g.apply(Action::RollPool {
+        dice: vec![1, 2, 3],
+    })
+    .unwrap();
+    assert_eq!(g.phase(), Phase::AwaitReroll);
+    assert_eq!(g.runes(P1).movement, 0);
+    assert_eq!(
+        g.legal_actions(),
+        [
+            Action::KeepRoll,
+            Action::Reroll { index: 0 },
+            Action::Reroll { index: 1 },
+            Action::Reroll { index: 2 }
+        ]
+    );
+    for action in g.legal_actions() {
+        g.clone().apply(action).unwrap();
+    }
+    assert_rejected(&mut g, Action::Reroll { index: 3 }, RuleError::InvalidDice);
+    assert_rejected(
+        &mut g,
+        Action::ChooseSummon { die: 1 },
+        RuleError::WrongPhase,
+    );
+    let mut keep = g.clone();
+    let before = keep.rng.get_seed();
+    keep.apply(Action::KeepRoll).unwrap();
+    assert_eq!(keep.rng.get_seed(), before);
+    assert_eq!(keep.runes(P1).movement, 2);
+    assert_eq!(
+        keep.legal_actions(),
+        [
+            Action::ChooseSummon { die: 1 },
+            Action::ChooseSummon { die: 2 }
+        ]
+    );
+    g.apply(Action::Reroll { index: 0 }).unwrap();
+    assert_eq!(g.phase(), Phase::Action);
+    assert_eq!(g.runes(P1).movement, 4);
+    assert_eq!(g.unsummoned(P1).count(), 15);
+    assert_rejected(&mut g, Action::Reroll { index: 0 }, RuleError::WrongPhase);
+}

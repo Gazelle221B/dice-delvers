@@ -118,6 +118,7 @@ fn faces_text(faces: &[Face]) -> String {
 fn phase_text(p: Phase) -> &'static str {
     match p {
         Phase::Roll => "ロール",
+        Phase::AwaitReroll => "出目を確定",
         Phase::ChooseSummon => "召喚ダイス選択",
         Phase::Place { .. } => "召喚 (タイル配置)",
         Phase::Action => "行動",
@@ -153,7 +154,7 @@ fn title(ui: &mut egui::Ui) -> Option<Screen> {
             ui.label(egui::RichText::new("Dice Delvers").size(48.0).strong());
             ui.add_space(8.0);
             ui.label(
-                "ダイスでルーンを集め、モンスターと迷宮タイルで相手のウォーデンを3回攻撃しよう。",
+                "ダイスでルーンを集め、モンスターと迷宮タイルで相手のウォーデンのLPを0にしよう。",
             );
             ui.add_space(24.0);
             for (label, pool) in [("basic", false), ("ダイスプール", true)] {
@@ -178,6 +179,30 @@ fn title(ui: &mut egui::Ui) -> Option<Screen> {
                     }
                 }
             }
+            ui.collapsing("実験用ルール", |ui| {
+                for (key, label) in [
+                    ("p2-move", "後手に移動1"),
+                    ("opening-two", "先手初手2個"),
+                    ("reroll", "振り直し"),
+                    ("lp5", "LP 5"),
+                ] {
+                    ui.push_id(key, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            for (name, mode) in
+                                [("対 CPU", Mode::VsCpu), ("ローカル2人", Mode::Local)]
+                            {
+                                if ui.button(name).clicked() {
+                                    next = Some(Screen::Play(Box::new(Play::new(
+                                        mode,
+                                        Ruleset::experiment(key).unwrap(),
+                                    ))));
+                                }
+                            }
+                        })
+                    });
+                }
+            });
         });
     });
     next
@@ -729,6 +754,37 @@ impl Play {
         match phase {
             Phase::Roll if g.rules().personal_pool => self.pool_roll_ui(ui, now),
             Phase::Roll => self.roll_ui(ui, now),
+            Phase::AwaitReroll => {
+                ui.label("出目を確定するか、ダイスを1個振り直してください");
+                let mut picked = None;
+                ui.horizontal_wrapped(|ui| {
+                    for a in g.legal_actions() {
+                        let label = match a {
+                            Action::KeepRoll => "このまま確定".to_owned(),
+                            Action::Reroll { index } => {
+                                let roll = g.last_roll().unwrap()[index];
+                                let name = g
+                                    .pending_die(index)
+                                    .and_then(|id| g.monster(id))
+                                    .map_or("", |(_, m)| m.name);
+                                format!(
+                                    "{}: {name} Lv{} {} を振り直す",
+                                    index + 1,
+                                    roll.level,
+                                    face_text(roll.face)
+                                )
+                            }
+                            _ => unreachable!(),
+                        };
+                        if ui.button(label).clicked() {
+                            picked = Some(a);
+                        }
+                    }
+                });
+                if let Some(a) = picked {
+                    self.act(a, now);
+                }
+            }
             Phase::ChooseSummon => {
                 ui.label("召喚するダイスを選択");
                 for action in self.game.legal_actions() {

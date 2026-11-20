@@ -1,6 +1,6 @@
 //! 対局ごとに差し替えられるルールの数値と定義 (ルールセット)。
 
-use crate::{Ability, Face, Rune};
+use crate::{Ability, Face, Rune, RunePool};
 
 /// モンスター 1 体の定義。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub struct Die {
 pub struct Ruleset {
     /// 各席の未召喚モンスターに対応する個別ダイスを使う。
     pub personal_pool: bool,
+    pub initial_runes: [RunePool; 2],
+    /// 個人プールの先手第1手番だけの上限。
+    pub opening_pool_roll: Option<usize>,
+    pub reroll_one: bool,
     pub name: &'static str,
     /// 盤面の列数。ドメインは (0, height / 2) と (width - 1, height / 2)。
     pub width: usize,
@@ -72,6 +76,9 @@ impl Ruleset {
         Self {
             name: "basic",
             personal_pool: false,
+            initial_runes: [RunePool::default(); 2],
+            opening_pool_roll: None,
+            reroll_one: false,
             width: 13,
             height: 11,
             lp: 3,
@@ -194,6 +201,31 @@ impl Ruleset {
                 .collect();
         }
         rules
+    }
+
+    /// pool から一項目だけ変えた、既定ではない実験プリセット。
+    pub fn experiment(name: &str) -> Option<Self> {
+        let mut rules = Self::pool();
+        rules.name = match name {
+            "p2-move" => {
+                rules.initial_runes[1].movement = 1;
+                "p2-move"
+            }
+            "opening-two" => {
+                rules.opening_pool_roll = Some(2);
+                "opening-two"
+            }
+            "reroll" => {
+                rules.reroll_one = true;
+                "reroll"
+            }
+            "lp5" => {
+                rules.lp = 5;
+                "lp5"
+            }
+            _ => return None,
+        };
+        Some(rules)
     }
 
     /// 名前 (大文字小文字は区別しない) から陣営の添字を引く。

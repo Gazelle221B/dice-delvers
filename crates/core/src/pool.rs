@@ -21,9 +21,14 @@ pub(super) fn combinations(
 
 impl Game {
     pub fn pool_roll_size(&self) -> usize {
-        self.rules
-            .dice_per_roll
-            .min(self.unsummoned(self.turn_player).count())
+        let count = if self.turn == 1 && self.turn_player == Player::P1 {
+            self.rules
+                .opening_pool_roll
+                .unwrap_or(self.rules.dice_per_roll)
+        } else {
+            self.rules.dice_per_roll
+        };
+        count.min(self.unsummoned(self.turn_player).count())
     }
 
     /// ダイスは順序を持たないので昇順の ID 列だけを受理する。
