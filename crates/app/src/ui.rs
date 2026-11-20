@@ -38,6 +38,7 @@ struct Sel {
     flip: bool,
     /// レベルごとのダイス選択数 (添字 = レベル - 1、合計 = Ruleset::dice_per_roll)
     dice: Vec<u8>,
+    pool_dice: Vec<usize>,
 }
 
 pub struct Play {
@@ -117,6 +118,7 @@ fn faces_text(faces: &[Face]) -> String {
 fn phase_text(p: Phase) -> &'static str {
     match p {
         Phase::Roll => "ロール",
+        Phase::ChooseSummon => "召喚ダイス選択",
         Phase::Place { .. } => "召喚 (タイル配置)",
         Phase::Action => "行動",
         Phase::AwaitDefense { .. } => "防御選択",
@@ -154,29 +156,35 @@ fn title(ui: &mut egui::Ui) -> Option<Screen> {
                 "ダイスでルーンを集め、モンスターと迷宮タイルで相手のウォーデンを3回攻撃しよう。",
             );
             ui.add_space(24.0);
-            let mut mode = None;
-            if ui
-                .add_sized([260.0, 44.0], egui::Button::new("対 CPU (あなた = P1)"))
-                .clicked()
-            {
-                mode = Some(Mode::VsCpu);
+            for (label, pool) in [("basic", false), ("ダイスプール", true)] {
+                ui.label(label);
+                for (title, mode) in [
+                    ("対 CPU (あなた = P1)", Mode::VsCpu),
+                    ("ローカル 2 人", Mode::Local),
+                ] {
+                    if ui
+                        .push_id(pool, |ui| {
+                            ui.add_sized([260.0, 36.0], egui::Button::new(title))
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        let rules = if pool {
+                            Ruleset::pool()
+                        } else {
+                            Ruleset::basic()
+                        };
+                        next = Some(Screen::Play(Box::new(Play::new(mode, rules))));
+                    }
+                }
             }
-            ui.add_space(8.0);
-            if ui
-                .add_sized([260.0, 44.0], egui::Button::new("ローカル 2 人"))
-                .clicked()
-            {
-                mode = Some(Mode::Local);
-            }
-            next = mode.map(|m| Screen::Play(Box::new(Play::new(m))));
         });
     });
     next
 }
 
 impl Play {
-    fn new(mode: Mode) -> Self {
-        let rules = Ruleset::basic();
+    fn new(mode: Mode, rules: Ruleset) -> Self {
         assert!(
             rules.width * rules.height <= MAX_CELLS,
             "ルールセット {} の盤面は描画できない",
@@ -197,6 +205,7 @@ impl Play {
                 rot: 0,
                 flip: false,
                 dice,
+                pool_dice: Vec::new(),
             },
             next_cpu: 0.0,
             toast: None,
@@ -240,7 +249,11 @@ impl Play {
             .default_size(340.0_f32.min(width * 0.45))
             .max_size(width * 0.6)
             .show(ui, |ui| {
-                if self.side(ui) {
+                if egui::ScrollArea::vertical()
+                    .id_salt("side")
+                    .show(ui, |ui| self.side(ui))
+                    .inner
+                {
                     next = Some(Screen::Title);
                 }
             });
@@ -259,7 +272,10 @@ impl Play {
                     ui.label(egui::RichText::new(text).size(28.0).strong());
                     ui.horizontal(|ui| {
                         if ui.button("もう一度").clicked() {
-                            next = Some(Screen::Play(Box::new(Play::new(self.mode))));
+                            next = Some(Screen::Play(Box::new(Play::new(
+                                self.mode,
+                                self.game.rules().clone(),
+                            ))));
                         }
                         if ui.button("タイトルへ").clicked() {
                             next = Some(Screen::Title);
@@ -278,7 +294,10 @@ impl Play {
 
     /// 操作を core に適用。Err はトーストに出す。
     fn act(&mut self, a: Action, now: f64) {
-        let clears = matches!(a, Action::EndTurn | Action::Roll { .. });
+        let clears = matches!(
+            a,
+            Action::EndTurn | Action::Roll { .. } | Action::RollPool { .. }
+        );
         match self.game.apply(a) {
             Ok(()) => {
                 self.sel.twin = false;
@@ -286,6 +305,9 @@ impl Play {
                     Some(Combatant::Unit(id)) => self.game.unit(id).is_none(),
                     _ => false,
                 };
+                if clears {
+                    self.sel.pool_dice.clear();
+                }
                 if gone || clears {
                     self.sel.unit = None;
                 }
@@ -615,7 +637,19 @@ impl Play {
                 "ルーン  移動 {}  攻撃 {}  守護 {}  魔法 {}  罠 {}",
                 r.movement, r.attack, r.guard, r.magic, r.trap
             ));
-            for (id, m) in g.roster(p) {
+            if g.rules().personal_pool {
+                egui::CollapsingHeader::new(format!("残りプール ({}個)", g.unsummoned(p).count()))
+                    .id_salt(("pool", p.index()))
+                    .show(ui, |ui| {
+                        for (_, m) in g.unsummoned(p) {
+                            ui.label(format!("Lv{} {}", m.level, m.name));
+                        }
+                    });
+            }
+            for (id, m) in g
+                .roster(p)
+                .filter(|(id, _)| !g.rules().personal_pool || g.is_summoned(*id))
+            {
                 let state = match g.unit(id) {
                     Some(u) => format!("場に出ている HP {}/{}", u.hp, u.max_hp),
                     None if g.is_summoned(id) => "撃破".to_owned(),
@@ -693,7 +727,23 @@ impl Play {
             return;
         }
         match phase {
+            Phase::Roll if g.rules().personal_pool => self.pool_roll_ui(ui, now),
             Phase::Roll => self.roll_ui(ui, now),
+            Phase::ChooseSummon => {
+                ui.label("召喚するダイスを選択");
+                for action in self.game.legal_actions() {
+                    if let Action::ChooseSummon { die } = action {
+                        let m = self.game.monster(die).unwrap().1;
+                        if ui
+                            .button(format!("Lv{} {} ({:?})", m.level, m.name, m.ability))
+                            .clicked()
+                        {
+                            self.act(action, now);
+                            break;
+                        }
+                    }
+                }
+            }
             Phase::Place { level } => self.place_ui(ui, level),
             Phase::Action => self.action_ui(ui, now),
             Phase::AwaitDefense {
@@ -702,6 +752,47 @@ impl Play {
                 hits_left,
             } => self.defense_ui(ui, now, attacker, target, hits_left),
             Phase::Finished(_) => {}
+        }
+    }
+
+    fn pool_roll_ui(&mut self, ui: &mut egui::Ui, now: f64) {
+        let g = &self.game;
+        let selected = &mut self.sel.pool_dice;
+        ui.label(format!(
+            "残りプールから選択 {}/{} 個",
+            selected.len(),
+            g.pool_roll_size()
+        ));
+        ui.horizontal_wrapped(|ui| {
+            for (id, m) in g.unsummoned(g.turn_player()) {
+                let index = selected.binary_search(&id);
+                let enabled = index.is_ok() || selected.len() < g.pool_roll_size();
+                let button =
+                    egui::Button::selectable(index.is_ok(), format!("Lv{} {}", m.level, m.name));
+                if ui
+                    .add_enabled(enabled, button)
+                    .on_hover_text(format!(
+                        "{} / {}",
+                        ability_text(m.ability),
+                        faces_text(&g.rules().dice[usize::from(m.level - 1)].faces)
+                    ))
+                    .clicked()
+                {
+                    match index {
+                        Ok(i) => {
+                            selected.remove(i);
+                        }
+                        Err(i) => selected.insert(i, id),
+                    }
+                }
+            }
+        });
+        if ui
+            .add_enabled(g.valid_pool_roll(selected), egui::Button::new("ロール！"))
+            .clicked()
+        {
+            let dice = std::mem::take(selected);
+            self.act(Action::RollPool { dice }, now);
         }
     }
 
@@ -754,7 +845,7 @@ impl Play {
     fn place_ui(&mut self, ui: &mut egui::Ui, level: u8) {
         let g = &self.game;
         let name = g
-            .summonable(g.turn_player(), level)
+            .placing_monster(level)
             .and_then(|id| g.monster(id))
             .map_or("?", |(_, m)| m.name);
         ui.label(format!(

@@ -7,7 +7,7 @@ use std::{env, ops::Range, process::ExitCode, sync::Arc};
 
 use delvers_core::{Action, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
 
-const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random> <greedy|random> [ember-frost|frost-ember|ember-ember|frost-frost]";
+const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random> <greedy|random> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool]";
 
 #[derive(Debug, Clone, Copy)]
 enum Policy {
@@ -53,6 +53,9 @@ struct Stats {
     disconnected: u64,
     inactive_turns: u64,
     summons: [u64; 2],
+    histogram: [Vec<u64>; 2],
+    remaining: [u64; 2],
+    lv4_summons: u64,
     attacks_disconnected: u64,
     exhausted_disconnected: u64,
     lv4_pairs: u64,
@@ -86,11 +89,14 @@ impl Stats {
                 self.greedy_rolls += 1;
                 self.greedy_roll_exceptions += u64::from(dice.iter().any(|&lv| lv != expected));
             }
+            let placed_four = matches!(action, Action::Place { .. })
+                && matches!(game.phase(), delvers_core::Phase::Place { level: 4 });
             game.apply(action.clone())
                 .unwrap_or_else(|e| panic!("seed={seed} turn={} {action:?}: {e}", game.turn()));
             match action {
                 Action::Place { .. } => {
                     summons[seat] += 1;
+                    self.lv4_summons += u64::from(placed_four);
                     active = true;
                 }
                 Action::Attack { .. } | Action::TwinStrike { .. } => {
@@ -98,7 +104,7 @@ impl Stats {
                     active = true;
                 }
                 Action::Move { .. } => active = true,
-                Action::Roll { .. } => {
+                Action::Roll { .. } | Action::RollPool { .. } => {
                     if game
                         .last_roll()
                         .unwrap()
@@ -131,20 +137,35 @@ impl Stats {
         if !game.domains_connected() {
             self.disconnected += 1;
             self.attacks_disconnected += attacks;
-            if summons == [3, 3] && reason == EndReason::TurnLimit && !game.units().is_empty() {
+            if [Player::P1, Player::P2]
+                .iter()
+                .all(|&p| game.unsummoned(p).next().is_none())
+                && reason == EndReason::TurnLimit
+                && !game.units().is_empty()
+            {
                 self.exhausted_disconnected += 1;
             }
         }
         for player in [Player::P1, Player::P2] {
-            self.summons[player.index()] += summons[player.index()];
+            let seat = player.index();
+            self.summons[seat] += summons[seat];
+            let count = summons[seat] as usize;
+            let hist = &mut self.histogram[seat];
+            if hist.len() <= count {
+                hist.resize(count + 1, 0);
+            }
+            hist[count] += 1;
+            if rules.personal_pool {
+                self.remaining[seat] += game.unsummoned(player).count() as u64;
+            }
         }
     }
 
-    fn report(&mut self) {
+    fn report(&mut self, personal_pool: bool) {
         self.turns.sort_unstable();
         let n = self.turns.len();
         let total: u64 = self.turns.iter().copied().map(u64::from).sum();
-        let median = f64::from(self.turns[(n - 1) / 2] + self.turns[n / 2]) / 2.;
+        let median = (f64::from(self.turns[(n - 1) / 2]) + f64::from(self.turns[n / 2])) / 2.;
         let pct = |count| 100. * count as f64 / n as f64;
         println!(
             "試合数 {n}　先手勝 {} ({:.2}%)　後手勝 {} ({:.2}%)　引分 {} ({:.2}%)",
@@ -176,15 +197,48 @@ impl Stats {
             self.summons[0] as f64 / n as f64,
             self.summons[1] as f64 / n as f64
         );
+        for (i, &wins) in self.wins.iter().enumerate() {
+            let (lo, hi) = wilson(wins, n);
+            println!(
+                "P{} 勝率95%区間 [{:.2}, {:.2}]　召喚数別件数 (0体から) {:?}",
+                i + 1,
+                100. * lo,
+                100. * hi,
+                self.histogram[i]
+            );
+        }
+        if personal_pool {
+            println!(
+                "平均残りダイス 先手 {:.4}　後手 {:.4}",
+                self.remaining[0] as f64 / n as f64,
+                self.remaining[1] as f64 / n as f64
+            );
+        } else {
+            println!(
+                "貪欲ロール例外 {}/{}",
+                self.greedy_roll_exceptions, self.greedy_rolls
+            );
+        }
         println!(
-            "未連結試合の攻撃宣言 {}　未連結かつ双方3体召喚・生存あり・上限 {}　召喚4が2面以上のロール {}　貪欲ロール例外 {}/{}",
+            "未連結試合の攻撃宣言 {}　未連結かつ双方ロスター全召喚・生存あり・上限 {}　召喚4が2面以上のロール {}　Lv4召喚 {}",
             self.attacks_disconnected,
             self.exhausted_disconnected,
             self.lv4_pairs,
-            self.greedy_roll_exceptions,
-            self.greedy_rolls
+            self.lv4_summons
         );
     }
+}
+
+/// 引き分けを含む全試合を分母とする二項比率の Wilson スコア区間。
+fn wilson(wins: u64, games: usize) -> (f64, f64) {
+    let n = games as f64;
+    let p = wins as f64 / n;
+    let z = 1.959963984540054;
+    let z2 = z * z;
+    let denom = 1. + z2 / n;
+    let center = (p + z2 / (2. * n)) / denom;
+    let half = z * ((p * (1. - p) + z2 / (4. * n)) / n).sqrt() / denom;
+    ((center - half).max(0.), (center + half).min(1.))
 }
 
 fn run() -> Result<(), String> {
@@ -193,18 +247,25 @@ fn run() -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    if !(3..=4).contains(&args.len()) {
+    if !(3..=5).contains(&args.len()) {
         return Err(USAGE.into());
     }
     let range = seeds(&args[0])?;
     let policies = [policy(&args[1])?, policy(&args[2])?];
-    let rules = Arc::new(Ruleset::basic());
+    let rules = Arc::new(match args.get(4).map(String::as_str).unwrap_or("basic") {
+        "basic" => Ruleset::basic(),
+        "pool" => Ruleset::pool(),
+        x => return Err(format!("未知のルールセット: {x}")),
+    });
     let pairing = args.get(3).map(String::as_str).unwrap_or("ember-frost");
     let seats = pairing
         .split_once('-')
         .and_then(|(a, b)| Some([rules.faction_index(a)?, rules.faction_index(b)?]))
         .ok_or_else(|| format!("未知の陣営設定: {pairing}"))?;
     let names = seats.map(|seat| rules.factions[seat].name);
+    if rules.personal_pool {
+        print!("pool　");
+    }
     println!(
         "シード {range:?}　方策 {policies:?}　陣営 [{}]",
         names.join(", ")
@@ -213,7 +274,7 @@ fn run() -> Result<(), String> {
     for seed in range {
         stats.play(&rules, seed, policies, seats);
     }
-    stats.report();
+    stats.report(rules.personal_pool);
     Ok(())
 }
 
@@ -237,6 +298,21 @@ mod tests {
         assert_eq!(seeds("4+2"), Ok(4..6));
         for invalid in ["0", "1..1", "2..1", "0+0", "-1+2", "18446744073709551615+1"] {
             assert!(seeds(invalid).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    #[test]
+    fn wilson_handles_extremes_and_balanced_samples() {
+        for (wins, lo, hi) in [
+            (0, 0., 0.001917),
+            (1000, 0.478108, 0.521892),
+            (2000, 0.998083, 1.),
+        ] {
+            let (left, right) = super::wilson(wins, 2000);
+            assert!((left - lo).abs() < 0.00001 && (right - hi).abs() < 0.00001);
         }
     }
 }
