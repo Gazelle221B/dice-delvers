@@ -130,13 +130,18 @@ impl Game {
 
     /// この手番で移動できる停止マスと、それぞれの最小移動ルーン消費。
     pub fn reachable(&self, id: UnitId) -> Vec<(Pos, u8)> {
+        self.reachable_with_budget(id, self.runes(self.turn_player).movement)
+    }
+
+    /// 指定した移動ルーン数で到達できるマス。占有・能力・行動済みの制約は通常どおり。
+    pub fn reachable_with_budget(&self, id: UnitId, budget: u8) -> Vec<(Pos, u8)> {
         let Some(unit) = self.unit(id) else {
             return Vec::new();
         };
         if self.phase != Phase::Action || unit.owner != self.turn_player || unit.moved {
             return Vec::new();
         }
-        let budget = self.runes(unit.owner).movement;
+        let budget = budget.min(self.rules.rune_cap);
         let (x, y) = unit.pos;
         let mut seen = vec![false; self.rules.width * self.rules.height];
         seen[y * self.rules.width + x] = true;

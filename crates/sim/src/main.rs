@@ -3,9 +3,9 @@
 #[cfg(target_arch = "wasm32")]
 compile_error!("delvers-sim はネイティブ専用です");
 
-use std::{env, ops::Range, process::ExitCode, sync::Arc};
+use std::{collections::BTreeMap, env, ops::Range, process::ExitCode, sync::Arc};
 
-use delvers_core::{Action, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
+use delvers_core::{Action, Combatant, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
 
 const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random> <greedy|random> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool]";
 
@@ -44,6 +44,43 @@ fn seeds(s: &str) -> Result<Range<u64>, String> {
     Ok(start..end)
 }
 
+// 大きい値ほど行動しやすい。Wings の前後を含め、その手番で得た最大の機会を記録する。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Opportunity {
+    #[default]
+    NoTarget,
+    LacksRune,
+    Legal,
+}
+
+fn opportunities(game: &Game) -> [Opportunity; 2] {
+    use Opportunity::*;
+    let player = game.turn_player();
+    let units = || game.units().iter().filter(|u| u.owner == player);
+    let movement = if units().any(|u| !game.reachable(u.id).is_empty()) {
+        Legal
+    } else if units().any(|u| {
+        !game
+            .reachable_with_budget(u.id, game.rules().rune_cap)
+            .is_empty()
+    }) {
+        LacksRune
+    } else {
+        NoTarget
+    };
+    let target = std::iter::once(Combatant::Warden(player))
+        .chain(units().map(|u| Combatant::Unit(u.id)))
+        .any(|a| !game.attack_targets_ignoring_runes(a).is_empty());
+    let attack = if !target {
+        NoTarget
+    } else if game.runes(player).attack == 0 {
+        LacksRune
+    } else {
+        Legal
+    };
+    [movement, attack]
+}
+
 #[derive(Default)]
 struct Stats {
     wins: [u64; 2],
@@ -52,6 +89,7 @@ struct Stats {
     turns: Vec<u16>,
     disconnected: u64,
     inactive_turns: u64,
+    inactive: BTreeMap<(bool, bool, [Opportunity; 2]), u64>,
     summons: [u64; 2],
     histogram: [Vec<u64>; 2],
     remaining: [u64; 2],
@@ -70,6 +108,7 @@ impl Stats {
         // 方策の抽選がダイスの乱数列を消費しないよう分ける。
         let mut rng = fastrand::Rng::with_seed(!seed);
         let mut active = false;
+        let mut opportunity = [Opportunity::NoTarget; 2];
         let mut attacks = 0;
         let mut summons = [0; 2];
         while let Some(actor) = game.to_act() {
@@ -88,6 +127,17 @@ impl Stats {
                     .unwrap_or(2);
                 self.greedy_rolls += 1;
                 self.greedy_roll_exceptions += u64::from(dice.iter().any(|&lv| lv != expected));
+            }
+            if !active && matches!(action, Action::Wings { .. } | Action::EndTurn) {
+                let now = opportunities(&game);
+                opportunity = std::array::from_fn(|i| opportunity[i].max(now[i]));
+                if action == Action::EndTurn {
+                    let living = game.units().iter().any(|u| u.owner == actor);
+                    *self
+                        .inactive
+                        .entry((summons[seat] > 0, living, opportunity))
+                        .or_default() += 1;
+                }
             }
             let placed_four = matches!(action, Action::Place { .. })
                 && matches!(game.phase(), delvers_core::Phase::Place { level: 4 });
@@ -121,6 +171,7 @@ impl Stats {
             if action == Action::EndTurn || game.outcome().is_some() {
                 self.inactive_turns += u64::from(!active);
                 active = false;
+                opportunity = [Opportunity::NoTarget; 2];
             }
         }
         match game.outcome().unwrap() {
@@ -192,6 +243,14 @@ impl Stats {
             self.inactive_turns,
             100. * self.inactive_turns as f64 / total as f64
         );
+        assert_eq!(self.inactive.values().sum::<u64>(), self.inactive_turns);
+        for ((after, living, [movement, attack]), count) in &self.inactive {
+            println!(
+                "非活動内訳 初召喚{} 自駒{} 移動 {movement:?} 攻撃 {attack:?} {count}",
+                if *after { "後" } else { "前" },
+                if *living { "あり" } else { "なし" }
+            );
+        }
         println!(
             "平均召喚 先手 {:.4}　後手 {:.4}",
             self.summons[0] as f64 / n as f64,

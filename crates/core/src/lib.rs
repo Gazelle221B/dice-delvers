@@ -777,8 +777,16 @@ impl Game {
 
     /// このフェーズで通常攻撃できる対象。
     pub fn attack_targets(&self, attacker: Combatant) -> Vec<Combatant> {
+        if self.runes(self.turn_player).attack == 0 {
+            return Vec::new();
+        }
+        self.attack_targets_ignoring_runes(attacker)
+    }
+
+    /// 攻撃ルーンだけを補充した場合に選べる通常攻撃対象。
+    pub fn attack_targets_ignoring_runes(&self, attacker: Combatant) -> Vec<Combatant> {
         let player = self.turn_player;
-        if self.phase != Phase::Action || self.runes(player).attack == 0 {
+        if self.phase != Phase::Action {
             return Vec::new();
         }
         let (pos, can_hit_flying) = match attacker {
