@@ -1124,3 +1124,16 @@ fn pool_legal_actions_apply_throughout_a_game() {
     }
     assert!(game.legal_actions().is_empty());
 }
+
+#[test]
+fn tactical_uses_only_public_position_and_policy_seed() {
+    let mut game = Game::new(Arc::new(Ruleset::pool()), [0, 0], 1);
+    let mut other = game.clone();
+    other.rng = fastrand::Rng::with_seed(2);
+    let dice_seed = game.rng.get_seed();
+    let a = ai::tactical(&game, &mut fastrand::Rng::with_seed(3));
+    assert_eq!(a, ai::tactical(&other, &mut fastrand::Rng::with_seed(3)));
+    assert_eq!(game.rng.get_seed(), dice_seed);
+    assert!(game.legal_actions().contains(&a));
+    game.apply(a).unwrap();
+}
