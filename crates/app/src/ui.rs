@@ -638,18 +638,13 @@ impl Play {
                 r.movement, r.attack, r.guard, r.magic, r.trap
             ));
             if g.rules().personal_pool {
-                let names = g
-                    .unsummoned(p)
-                    .map(|(_, m)| format!("Lv{} {}", m.level, m.name))
-                    .collect::<Vec<_>>();
-                ui.collapsing(
-                    format!("{} 残りプール ({}個)", g.player_name(p), names.len()),
-                    |ui| {
-                        for name in names {
-                            ui.label(name);
+                egui::CollapsingHeader::new(format!("残りプール ({}個)", g.unsummoned(p).count()))
+                    .id_salt(("pool", p.index()))
+                    .show(ui, |ui| {
+                        for (_, m) in g.unsummoned(p) {
+                            ui.label(format!("Lv{} {}", m.level, m.name));
                         }
-                    },
-                );
+                    });
             }
             for (id, m) in g
                 .roster(p)
