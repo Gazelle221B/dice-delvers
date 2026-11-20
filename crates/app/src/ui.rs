@@ -1,13 +1,15 @@
 //! ゲーム画面 (タイトル・盤面・操作パネル・サイドパネル)。
 //! ルール判定は持たず、`delvers-core` のクエリ (`reachable` / `attack_targets` / `is_legal_placement` など) に任せる。
 
+use std::sync::Arc;
+
 use delvers_core::{
-    Ability, Action, Cell, Combatant, DICE_FACES, DefenseChoice, Face, Game, Outcome, Phase,
-    Placement, Player, Pos, Rune, WARDEN_ATK, ai, placement_cells,
+    Ability, Action, Cell, Combatant, DefenseChoice, Face, Game, Outcome, Phase, Placement, Player,
+    Pos, Ruleset, Rune, ai, placement_cells,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, vec2};
 
-use crate::board::{self, BoardView, CELLS, COLS, ROWS, cell, hl};
+use crate::board::{self, BoardView, MAX_CELLS, cell, hl};
 
 /// CPU が 1 手指すごとの待ち時間 (秒)。
 const CPU_DELAY: f64 = 0.4;
@@ -34,8 +36,8 @@ struct Sel {
     shape: u8,
     rot: u8,
     flip: bool,
-    /// レベル 1〜4 のダイス選択数 (合計 3)
-    dice: [u8; 4],
+    /// レベルごとのダイス選択数 (添字 = レベル - 1、合計 = Ruleset::dice_per_roll)
+    dice: Vec<u8>,
 }
 
 pub struct Play {
@@ -96,9 +98,9 @@ fn face_text(f: Face) -> String {
 }
 
 /// 「召喚1(4面) 移動 守護×2」形式のダイス面一覧。
-fn faces_text(level: u8) -> String {
+fn faces_text(faces: &[Face]) -> String {
     let mut out: Vec<(String, u8)> = Vec::new();
-    for &f in &DICE_FACES[usize::from(level - 1)] {
+    for &f in faces {
         let t = face_text(f);
         match out.iter_mut().find(|(s, _)| *s == t) {
             Some((_, n)) => *n += 1,
@@ -125,7 +127,7 @@ fn phase_text(p: Phase) -> &'static str {
 fn comb_pos(g: &Game, c: Combatant) -> Option<Pos> {
     match c {
         Combatant::Unit(id) => g.unit(id).map(|u| u.pos),
-        Combatant::Warden(p) => Some(p.domain()),
+        Combatant::Warden(p) => Some(g.domain(p)),
     }
 }
 
@@ -174,8 +176,19 @@ fn title(ui: &mut egui::Ui) -> Option<Screen> {
 
 impl Play {
     fn new(mode: Mode) -> Self {
+        let rules = Ruleset::basic();
+        assert!(
+            rules.width * rules.height <= MAX_CELLS,
+            "ルールセット {} の盤面は描画できない",
+            rules.name
+        );
+        // 既定の選択は低いレベルから 1 個ずつ (basic では Lv1〜3 を 1 個ずつ)
+        let mut dice = vec![0; rules.dice.len()];
+        for i in 0..rules.dice_per_roll {
+            dice[i % rules.dice.len()] += 1;
+        }
         Self {
-            game: Game::new(seed()),
+            game: Game::new(Arc::new(rules), [0, 1], seed()),
             mode,
             sel: Sel {
                 unit: None,
@@ -183,7 +196,7 @@ impl Play {
                 shape: 0,
                 rot: 0,
                 flip: false,
-                dice: [1, 1, 1, 0],
+                dice,
             },
             next_cpu: 0.0,
             toast: None,
@@ -265,6 +278,7 @@ impl Play {
 
     /// 操作を core に適用。Err はトーストに出す。
     fn act(&mut self, a: Action, now: f64) {
+        let clears = matches!(a, Action::EndTurn | Action::Roll { .. });
         match self.game.apply(a) {
             Ok(()) => {
                 self.sel.twin = false;
@@ -272,7 +286,7 @@ impl Play {
                     Some(Combatant::Unit(id)) => self.game.unit(id).is_none(),
                     _ => false,
                 };
-                if gone || matches!(a, Action::EndTurn | Action::Roll { .. }) {
+                if gone || clears {
                     self.sel.unit = None;
                 }
             }
@@ -314,22 +328,20 @@ impl Play {
     }
 
     fn board(&mut self, ui: &mut egui::Ui, now: f64) {
+        let dims @ (cols, rows) = (self.game.rules().width, self.game.rules().height);
         let avail = ui.available_size();
-        let c = (avail.x / COLS as f32).min(avail.y / ROWS as f32).max(10.0);
-        let size = vec2(c * COLS as f32, c * ROWS as f32);
+        let c = (avail.x / cols as f32).min(avail.y / rows as f32).max(10.0);
+        let size = vec2(c * cols as f32, c * rows as f32);
         let rect = Rect::from_center_size(ui.available_rect_before_wrap().center(), size);
         let resp = ui.allocate_rect(rect, Sense::click());
-        let hover = resp.hover_pos().and_then(|p| board::cell_at(rect, p));
+        let hover = resp.hover_pos().and_then(|p| board::cell_at(rect, dims, p));
         self.hover = hover;
 
         let g = &self.game;
-        let mut view = BoardView {
-            time: now as f32,
-            ..Default::default()
-        };
+        let mut view = BoardView::new(cols, rows, now as f32);
         for (y, row) in g.board().iter().enumerate() {
             for (x, &cl) in row.iter().enumerate() {
-                view.cells[y * COLS + x] = match cl {
+                view.cells[y * cols + x] = match cl {
                     Cell::Empty => cell::EMPTY,
                     Cell::Domain(Player::P1) => cell::DOMAIN_P1,
                     Cell::Domain(Player::P2) => cell::DOMAIN_P2,
@@ -353,8 +365,8 @@ impl Play {
                         hl::INVALID
                     };
                     for (x, y) in cells {
-                        if (0..COLS as isize).contains(&x) && (0..ROWS as isize).contains(&y) {
-                            view.highlight[y as usize * COLS + x as usize] = v;
+                        if (0..cols as isize).contains(&x) && (0..rows as isize).contains(&y) {
+                            view.set_highlight((x as usize, y as usize), v);
                         }
                     }
                 }
@@ -362,42 +374,41 @@ impl Play {
             Phase::Action if human => {
                 if let Some(sel) = self.sel.unit {
                     if let Combatant::Unit(id) = sel {
-                        for (x, y) in g.reachable(id).into_iter().map(|r| r.0) {
-                            view.highlight[y * COLS + x] = hl::MOVE;
+                        for (pos, _) in g.reachable(id) {
+                            view.set_highlight(pos, hl::MOVE);
                         }
                     }
                     let targets = match (self.sel.twin, sel) {
                         (true, Combatant::Unit(id)) => g.twin_strike_targets(id),
                         _ => g.attack_targets(sel),
                     };
-                    for (x, y) in targets.into_iter().filter_map(|t| comb_pos(g, t)) {
-                        view.highlight[y * COLS + x] = hl::ATTACK;
+                    for pos in targets.into_iter().filter_map(|t| comb_pos(g, t)) {
+                        view.set_highlight(pos, hl::ATTACK);
                     }
                 }
             }
             Phase::AwaitDefense { target, .. } => {
-                if let Some((x, y)) = comb_pos(g, Combatant::Unit(target)) {
-                    view.highlight[y * COLS + x] = hl::ATTACK;
+                if let Some(pos) = comb_pos(g, Combatant::Unit(target)) {
+                    view.set_highlight(pos, hl::ATTACK);
                 }
             }
             _ => {}
         }
-        debug_assert_eq!(view.highlight.len(), CELLS);
 
         let painter = ui.painter_at(rect);
         board::paint(&painter, rect, &view);
-        self.draw_units(&painter, rect);
+        self.draw_units(&painter, rect, dims);
         if let Some((x, y)) = spawn {
             // 召喚マスを金の枠で強調
             painter.rect_stroke(
-                board::cell_rect(rect, x, y).shrink(2.0),
+                board::cell_rect(rect, dims, x, y).shrink(2.0),
                 2.0,
                 Stroke::new(3.0, Color32::GOLD),
                 StrokeKind::Inside,
             );
         } else if let Some((x, y)) = hover {
             painter.rect_stroke(
-                board::cell_rect(rect, x, y),
+                board::cell_rect(rect, dims, x, y),
                 0.0,
                 Stroke::new(2.0, Color32::WHITE),
                 StrokeKind::Inside,
@@ -455,7 +466,7 @@ impl Play {
         let own = g.turn_player();
         let new = if let Some(u) = g.unit_at(pos).filter(|u| u.owner == own) {
             Some(Combatant::Unit(u.id))
-        } else if pos == own.domain() {
+        } else if pos == g.domain(own) {
             Some(Combatant::Warden(own))
         } else {
             None
@@ -464,7 +475,7 @@ impl Play {
         self.sel.twin = false;
     }
 
-    fn draw_units(&self, painter: &egui::Painter, rect: Rect) {
+    fn draw_units(&self, painter: &egui::Painter, rect: Rect, dims: (usize, usize)) {
         let g = &self.game;
         let selected = self.sel.unit;
         let ring = |painter: &egui::Painter, center: Pos2, r: f32| {
@@ -472,8 +483,8 @@ impl Play {
         };
         for p in [Player::P1, Player::P2] {
             // ウォーデン (ドメイン上のひし形 + LP)
-            let (x, y) = p.domain();
-            let r = board::cell_rect(rect, x, y);
+            let (x, y) = g.domain(p);
+            let r = board::cell_rect(rect, dims, x, y);
             let ctr = r.center() + vec2(0.0, -r.height() * 0.08);
             let rad = r.width() * 0.34;
             painter.add(egui::Shape::convex_polygon(
@@ -505,7 +516,7 @@ impl Play {
             }
         }
         for u in g.units() {
-            let r = board::cell_rect(rect, u.pos.0, u.pos.1);
+            let r = board::cell_rect(rect, dims, u.pos.0, u.pos.1);
             let ctr = r.center() + vec2(0.0, -r.height() * 0.06);
             let rad = r.width() * 0.32;
             if u.flying {
@@ -604,15 +615,17 @@ impl Play {
                 "ルーン  移動 {}  攻撃 {}  守護 {}  魔法 {}  罠 {}",
                 r.movement, r.attack, r.guard, r.magic, r.trap
             ));
-            for lv in 1..=3u8 {
-                let (id, &(name, lv, hp, atk, def, ab)) = g.monster(p, lv).unwrap();
+            for (id, m) in g.roster(p) {
                 let state = match g.unit(id) {
                     Some(u) => format!("場に出ている HP {}/{}", u.hp, u.max_hp),
-                    None if g.has_summoned(p, lv) => "撃破".to_owned(),
+                    None if g.is_summoned(id) => "撃破".to_owned(),
                     None => "未召喚".to_owned(),
                 };
-                ui.label(format!("Lv{lv} {name} [{state}]  HP{hp} ATK{atk} DEF{def}"));
-                ui.weak(ability_text(ab));
+                ui.label(format!(
+                    "Lv{} {} [{state}]  HP{} ATK{} DEF{}",
+                    m.level, m.name, m.hp, m.atk, m.def
+                ));
+                ui.weak(ability_text(m.ability));
             }
         }
         ui.separator();
@@ -693,53 +706,57 @@ impl Play {
     }
 
     fn roll_ui(&mut self, ui: &mut egui::Ui, now: f64) {
-        let total: u8 = self.sel.dice.iter().sum();
+        let rules = self.game.rules();
+        let per_roll = rules.dice_per_roll;
+        let total: usize = self.sel.dice.iter().map(|&n| usize::from(n)).sum();
+        let mut roll = None;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                for lv in 1..=4u8 {
+                for (i, die) in rules.dice.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let n = &mut self.sel.dice[usize::from(lv - 1)];
-                        ui.label(format!("Lv{lv}"));
+                        let n = &mut self.sel.dice[i];
+                        ui.label(format!("Lv{}", i + 1));
                         if ui.add_enabled(*n > 0, egui::Button::new("−")).clicked() {
                             *n -= 1;
                         }
                         ui.label(n.to_string());
-                        if ui.add_enabled(total < 3, egui::Button::new("+")).clicked() {
+                        let more = total < per_roll && *n < die.copies;
+                        if ui.add_enabled(more, egui::Button::new("+")).clicked() {
                             *n += 1;
                         }
-                        ui.weak(faces_text(lv));
+                        ui.weak(faces_text(&die.faces));
                     });
                 }
             });
             ui.vertical(|ui| {
-                ui.label(format!("選択中 {total}/3 個 (同レベル複数可)"));
+                ui.label(format!("選択中 {total}/{per_roll} 個 (同レベル複数可)"));
                 if ui
                     .add_enabled(
-                        total == 3,
+                        total == per_roll,
                         egui::Button::new("ロール！").min_size(vec2(120.0, 36.0)),
                     )
                     .clicked()
                 {
-                    let mut dice = [0u8; 3];
-                    let levels = (1..=4u8).flat_map(|lv| {
-                        std::iter::repeat_n(lv, usize::from(self.sel.dice[usize::from(lv - 1)]))
-                    });
-                    for (d, lv) in dice.iter_mut().zip(levels) {
-                        *d = lv;
-                    }
-                    self.act(Action::Roll { dice }, now);
+                    roll = Some(
+                        (1..)
+                            .zip(&self.sel.dice)
+                            .flat_map(|(lv, &n)| std::iter::repeat_n(lv, usize::from(n)))
+                            .collect(),
+                    );
                 }
             });
         });
+        if let Some(dice) = roll {
+            self.act(Action::Roll { dice }, now);
+        }
     }
 
     fn place_ui(&mut self, ui: &mut egui::Ui, level: u8) {
-        let name = self
-            .game
-            .monster(self.game.turn_player(), level)
-            .unwrap()
-            .1
-            .0;
+        let g = &self.game;
+        let name = g
+            .summonable(g.turn_player(), level)
+            .and_then(|id| g.monster(id))
+            .map_or("?", |(_, m)| m.name);
         ui.label(format!(
             "Lv{level} {name} を召喚: 形を選び、盤面でタイルを置く場所をクリック (金枠 = 召喚マス)"
         ));
@@ -774,8 +791,9 @@ impl Play {
                         ""
                     };
                     ui.label(format!(
-                        "選択中: {} ATK {WARDEN_ATK}{status}",
-                        g.combatant_name(c)
+                        "選択中: {} ATK {}{status}",
+                        g.combatant_name(c),
+                        g.rules().warden_atk
                     ))
                 }
                 Some(c) => ui.label(format!("選択中: {}", g.combatant_name(c))),

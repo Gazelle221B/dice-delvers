@@ -1,9 +1,10 @@
-// 盤面 13×11 を 1 枚の全面三角形で描く。セルごとの状態は uniform の u32 (下位 8bit = セル状態, 次の 8bit = ハイライト)。
+// 盤面 (最大 144 マス、サイズは uniform の dims) を 1 枚の全面三角形で描く。セルごとの状態は uniform の u32 (下位 8bit = セル状態, 次の 8bit = ハイライト)。
 // WebGL2 互換のため storage buffer は使わず、u32 を vec4<u32> に 4 個ずつ詰めた uniform 配列にする。
 
 struct Board {
-    cells: array<vec4<u32>, 36>, // 13*11 = 143 個 (+1 パディング)
+    cells: array<vec4<u32>, 36>, // 最大 144 マス (行優先)
     params: vec4<f32>,           // x = time (秒)
+    dims: vec4<u32>,             // x = 列数, y = 行数
 };
 
 @group(0) @binding(0) var<uniform> board: Board;
@@ -23,17 +24,17 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
     return o;
 }
 
-const COLS: u32 = 13u;
-const ROWS: u32 = 11u;
 const P1: vec3<f32> = vec3<f32>(0.95, 0.40, 0.30);
 const P2: vec3<f32> = vec3<f32>(0.25, 0.55, 0.95);
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let g = in.uv * vec2<f32>(f32(COLS), f32(ROWS));
+    let cols = board.dims.x;
+    let rows = board.dims.y;
+    let g = in.uv * vec2<f32>(f32(cols), f32(rows));
     let px = fwidth(g); // 微分は分岐前 (uniform control flow) で取る
-    let c = min(vec2<u32>(g), vec2<u32>(COLS - 1u, ROWS - 1u));
-    let idx = c.y * COLS + c.x;
+    let c = min(vec2<u32>(g), vec2<u32>(cols - 1u, rows - 1u));
+    let idx = c.y * cols + c.x;
     let v = board.cells[idx / 4u][idx % 4u];
     let state = v & 0xffu;
     let hl = (v >> 8u) & 0xffu;

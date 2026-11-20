@@ -2,6 +2,20 @@ use super::*;
 use Combatant::{Unit as Creature, Warden};
 use Player::{P1, P2};
 
+fn basic(seed: u64) -> Game {
+    Game::new(Arc::new(Ruleset::basic()), [0, 1], seed)
+}
+
+/// 席ごとのビット i をロスター i 番目の召喚済みフラグにする。
+fn set_summoned(game: &mut Game, masks: [u8; 2]) {
+    for player in [P1, P2] {
+        let ids: Vec<_> = game.roster(player).map(|(id, _)| id).collect();
+        for (bit, id) in ids.into_iter().enumerate() {
+            game.summoned[id] = masks[player.index()] & (1 << bit) != 0;
+        }
+    }
+}
+
 fn seeded_roll(indices: [usize; 3]) -> Game {
     let seed = (0..)
         .find(|&seed| {
@@ -9,7 +23,7 @@ fn seeded_roll(indices: [usize; 3]) -> Game {
             indices == std::array::from_fn(|_| rng.usize(0..6))
         })
         .unwrap();
-    Game::new(seed)
+    basic(seed)
 }
 
 fn assert_rejected(game: &mut Game, action: Action, error: RuleError) {
@@ -21,10 +35,10 @@ fn assert_rejected(game: &mut Game, action: Action, error: RuleError) {
 }
 
 fn corridor(player: Player) -> Game {
-    let mut game = Game::new(0);
+    let mut game = basic(0);
     game.phase = Phase::Action;
     game.turn_player = player;
-    for x in 1..W - 1 {
+    for x in 1..game.rules.width - 1 {
         game.board[5][x] = Cell::Tile(P1);
     }
     game
@@ -45,12 +59,21 @@ fn roll_adds_runes_with_individual_caps() {
     game.runes[0].guard = 9;
     assert_rejected(
         &mut game,
-        Action::Roll { dice: [1, 2, 0] },
+        Action::Roll {
+            dice: vec![1, 2, 0],
+        },
         RuleError::InvalidDice,
     );
-    game.apply(Action::Roll { dice: [1, 2, 3] }).unwrap();
+    game.apply(Action::Roll {
+        dice: vec![1, 2, 3],
+    })
+    .unwrap();
     assert_eq!(
-        game.last_roll().unwrap().map(|roll| roll.face),
+        game.last_roll()
+            .unwrap()
+            .iter()
+            .map(|roll| roll.face)
+            .collect::<Vec<_>>(),
         [
             Face::Rune(Rune::Guard, 2),
             Face::Rune(Rune::Attack, 2),
@@ -70,7 +93,10 @@ fn roll_adds_runes_with_individual_caps() {
 
     let mut game = seeded_roll([3, 5, 4]);
     game.runes[0].movement = 9;
-    game.apply(Action::Roll { dice: [2, 2, 4] }).unwrap();
+    game.apply(Action::Roll {
+        dice: vec![2, 2, 4],
+    })
+    .unwrap();
     assert_eq!(
         game.runes(P1),
         RunePool {
@@ -84,7 +110,7 @@ fn roll_adds_runes_with_individual_caps() {
 #[test]
 fn summon_is_mandatory_when_possible() {
     let mut game = seeded_roll([0, 0, 4]);
-    game.apply(Action::Roll { dice: [1; 3] }).unwrap();
+    game.apply(Action::Roll { dice: vec![1; 3] }).unwrap();
     assert_eq!(game.phase(), Phase::Place { level: 1 });
     assert_eq!(game.runes(P1).movement, 1);
     assert_rejected(&mut game, Action::EndTurn, RuleError::WrongPhase);
@@ -95,7 +121,7 @@ fn summon_is_mandatory_when_possible() {
         let mut copy = game.clone();
         copy.apply(candidate.into()).unwrap();
         assert_eq!(copy.phase(), Phase::Action);
-        assert!(copy.has_summoned(P1, 1));
+        assert!(copy.is_summoned(0));
         assert_eq!(copy.units()[0].pos, spawn);
         assert!(
             cells
@@ -110,18 +136,18 @@ fn summon_is_skipped_for_used_or_missing_monster_and_blocked_domain() {
     let mut used = seeded_roll([0; 3]);
     used.summon(1, (1, 5));
     used.units.clear();
-    used.apply(Action::Roll { dice: [1; 3] }).unwrap();
+    used.apply(Action::Roll { dice: vec![1; 3] }).unwrap();
     assert_eq!(used.phase(), Phase::Action);
-    assert!(used.has_summoned(P1, 1));
+    assert!(used.is_summoned(0));
 
     let mut blocked = seeded_roll([0; 3]);
-    for (x, y) in board::neighbors(P1.domain()) {
+    for (x, y) in blocked.neighbors(blocked.domain(P1)) {
         blocked.board[y][x] = Cell::Tile(P2);
     }
-    blocked.apply(Action::Roll { dice: [1; 3] }).unwrap();
+    blocked.apply(Action::Roll { dice: vec![1; 3] }).unwrap();
     assert_eq!(blocked.phase(), Phase::Action);
 
-    for dice in [[4; 3], [1, 2, 3]] {
+    for dice in [vec![4; 3], vec![1, 2, 3]] {
         let mut unavailable = seeded_roll([0; 3]);
         unavailable.apply(Action::Roll { dice }).unwrap();
         assert_eq!(unavailable.phase(), Phase::Action);
@@ -132,8 +158,14 @@ fn summon_is_skipped_for_used_or_missing_monster_and_blocked_domain() {
 #[test]
 fn placement_requires_side_contact_and_empty_in_bounds_cells() {
     let mut game = seeded_roll([0; 3]);
-    game.apply(Action::Roll { dice: [1; 3] }).unwrap();
-    for origin in [(2, 4), (1, 2), (0, 4), (W - 2, 4), (usize::MAX, 0)] {
+    game.apply(Action::Roll { dice: vec![1; 3] }).unwrap();
+    for origin in [
+        (2, 4),
+        (1, 2),
+        (0, 4),
+        (game.rules.width - 2, 4),
+        (usize::MAX, 0),
+    ] {
         assert!(!game.is_legal_placement(placement(origin)));
         assert_rejected(
             &mut game,
@@ -193,11 +225,12 @@ fn movement_costs_depend_on_ability_and_charge_once() {
         for (i, cost) in costs.into_iter().enumerate() {
             assert!(reachable.contains(&((i + 2, 5), cost)));
         }
+        let domain = game.domain(player);
         assert_rejected(
             &mut game,
             Action::Move {
                 unit: id,
-                to: player.domain(),
+                to: domain,
             },
             RuleError::InvalidMove,
         );
@@ -286,7 +319,7 @@ fn flying_can_only_be_attacked_by_wardens_and_flying_units() {
     assert_eq!(game.pending_damage(DefenseChoice::None), Some(10));
     game.apply(Action::Defend(DefenseChoice::None)).unwrap();
     assert!(game.unit(3).is_none());
-    assert!(game.has_summoned(P2, 1));
+    assert!(game.is_summoned(3));
     assert!(!game.attack_targets(Warden(P1)).contains(&target));
     game.apply(Action::EndTurn).unwrap();
     assert!(!game.warden_attacked());
@@ -466,7 +499,7 @@ fn last_defeat_can_trigger_stalemate() {
     game.turn_player = P2;
     game.summon(1, (1, 5));
     game.turn_player = P1;
-    game.summoned = [0b111; 2];
+    set_summoned(&mut game, [0b111; 2]);
     game.lp[1] = 2;
     game.runes[0].attack = 1;
     game.apply(Action::Attack {
@@ -498,7 +531,7 @@ fn turn_limit_uses_lp_then_count_then_level_sum() {
     ] {
         let mut game = corridor(P2);
         game.summon(3, (11, 5));
-        game.summoned = summoned;
+        set_summoned(&mut game, summoned);
         game.lp = lp;
         game.turn = 300;
         game.apply(Action::EndTurn).unwrap();
@@ -511,14 +544,14 @@ fn turn_limit_uses_lp_then_count_then_level_sum() {
 #[test]
 fn cpu_mirror_matches_only_make_legal_moves_and_finish() {
     for seed in 0..24 {
-        let mut game = Game::new(seed);
+        let mut game = basic(seed);
         for _ in 0..300 * 16 {
             if game.to_act().is_none() {
                 break;
             }
             let action = ai::choose(&game);
             assert_eq!(
-                game.apply(action),
+                game.apply(action.clone()),
                 Ok(()),
                 "seed={seed}, turn={}, action={action:?}",
                 game.turn()
@@ -535,20 +568,22 @@ fn cpu_mirror_matches_only_make_legal_moves_and_finish() {
 
 #[test]
 fn mirror_rosters_preserve_seat_ids_and_use_faction_abilities() {
-    for faction in [Faction::Ember, Faction::Frost] {
-        let mut game = Game::with_factions(1, [faction; 2]);
+    let rules = Arc::new(Ruleset::basic());
+    for faction in 0..rules.factions.len() {
+        let mut game = Game::new(rules.clone(), [faction; 2], 1);
         for player in [P1, P2] {
             game.turn_player = player;
             for level in 1..=3 {
                 game.summon(level, (usize::from(level), player.index()));
-                let (id, definition) = game.monster(player, level).unwrap();
+                let (id, &definition) = game.roster(player).nth(usize::from(level - 1)).unwrap();
                 assert_eq!(id, player.index() * 3 + usize::from(level - 1));
+                assert_eq!(game.monster(id), Some((player, &definition)));
                 let unit = game.unit(id).unwrap();
                 assert_eq!(
                     unit.ability,
-                    MONSTERS[faction as usize * 3 + usize::from(level - 1)].5
+                    rules.factions[faction].monsters[usize::from(level - 1)].ability
                 );
-                assert_eq!(unit.name, definition.0);
+                assert_eq!(unit.name, definition.name);
                 assert_eq!(game.combatant_name(Creature(id)), unit.name);
             }
         }
@@ -561,10 +596,10 @@ fn legal_actions_agree_with_apply() {
     fn check(game: &Game, candidates: Vec<Action>) {
         let mut actions = game.legal_actions();
         for action in candidates {
-            if game.clone().apply(action).is_ok() {
+            if game.clone().apply(action.clone()).is_ok() {
                 let idx = actions
                     .iter()
-                    .position(|&a| a == action)
+                    .position(|a| *a == action)
                     .expect("合法手の列挙漏れ");
                 actions.swap_remove(idx);
             }
@@ -576,18 +611,20 @@ fn legal_actions_agree_with_apply() {
     for a in 0..=5 {
         for b in 0..=5 {
             for c in 0..=5 {
-                rolls.push(Action::Roll { dice: [a, b, c] });
+                rolls.push(Action::Roll {
+                    dice: vec![a, b, c],
+                });
             }
         }
     }
     check(&game, rolls);
-    game.apply(Action::Roll { dice: [1; 3] }).unwrap();
+    game.apply(Action::Roll { dice: vec![1; 3] }).unwrap();
     let mut placements = Vec::new();
     for shape in 0..11 {
         for rot in 0..4 {
             for flip in [false, true] {
-                for x in 0..W {
-                    for y in 0..H {
+                for x in 0..game.rules.width {
+                    for y in 0..game.rules.height {
                         placements.push(Action::Place {
                             shape,
                             rot,
@@ -636,8 +673,8 @@ fn legal_actions_agree_with_apply() {
         }
         for unit in 0..6 {
             candidates.push(Action::Wings { unit });
-            for x in 0..W {
-                for y in 0..H {
+            for x in 0..game.rules.width {
+                for y in 0..game.rules.height {
                     candidates.push(Action::Move { unit, to: (x, y) });
                 }
             }
@@ -678,17 +715,17 @@ fn domain_path_requires_edge_contact_along_tiles() {
 
 #[test]
 fn greedy_falls_back_to_level_two_when_placement_is_blocked() {
-    let mut game = Game::new(0);
-    for (x, y) in board::neighbors(P1.domain()) {
+    let mut game = basic(0);
+    for (x, y) in game.neighbors(game.domain(P1)) {
         game.board[y][x] = Cell::Tile(P2);
     }
-    assert!(!game.has_summoned(P1, 1));
-    assert_eq!(ai::choose(&game), Action::Roll { dice: [2; 3] });
+    assert!(!game.is_summoned(0));
+    assert_eq!(ai::choose(&game), Action::Roll { dice: vec![2; 3] });
 }
 
 #[test]
 fn logging_does_not_change_random_play() {
-    let mut logged = Game::new(17);
+    let mut logged = basic(17);
     let mut quiet = logged.clone();
     quiet.set_logging(false);
     let mut rng = fastrand::Rng::with_seed(41);
@@ -696,7 +733,7 @@ fn logging_does_not_change_random_play() {
     while logged.to_act().is_some() {
         let a = ai::choose_random(&logged, &mut rng);
         assert_eq!(ai::choose_random(&quiet, &mut other_rng), a);
-        logged.apply(a).unwrap();
+        logged.apply(a.clone()).unwrap();
         quiet.apply(a).unwrap();
         assert_eq!(logged.last_roll(), quiet.last_roll());
     }
@@ -706,4 +743,155 @@ fn logging_does_not_change_random_play() {
     assert_eq!(logged.end_reason(), quiet.end_reason());
     assert_eq!(logged.board(), quiet.board());
     assert_eq!(logged.units(), quiet.units());
+}
+
+/// ゴールデンテスト用の対局生成。ルールエンジンの API 変更時はここだけを追従させる。
+fn golden_game(seed: u64, factions: [&str; 2]) -> Game {
+    let rules = Ruleset::basic();
+    let seats = factions.map(|name| rules.faction_index(name).unwrap());
+    Game::new(Arc::new(rules), seats, seed)
+}
+
+/// Rust のバージョンに依存しない FNV-1a 64bit。
+fn fnv1a(hash: &mut u64, text: &str) {
+    for byte in text.bytes().chain([0xff]) {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+}
+
+/// 固定シードで最後まで対局し、行動列・出目・ログ・終局状態のハッシュを既知値と比べる。
+/// 既知値はルールセットのデータ化前のコードで計算した。挙動を意図して変えたとき以外は更新しない。
+#[test]
+fn golden_games_match_known_hashes() {
+    let mut results = Vec::new();
+    for factions in [
+        ["Ember", "Frost"],
+        ["Frost", "Ember"],
+        ["Ember", "Ember"],
+        ["Frost", "Frost"],
+    ] {
+        for random in [[false, false], [true, false], [false, true], [true, true]] {
+            let mut hash = 0xcbf2_9ce4_8422_2325;
+            for seed in 0..6 {
+                let mut game = golden_game(seed, factions);
+                let mut rng = fastrand::Rng::with_seed(!seed);
+                while let Some(actor) = game.to_act() {
+                    let action = if random[actor.index()] {
+                        ai::choose_random(&game, &mut rng)
+                    } else {
+                        ai::choose(&game)
+                    };
+                    fnv1a(&mut hash, &format!("{action:?}"));
+                    let rolled = matches!(action, Action::Roll { .. });
+                    game.apply(action).unwrap();
+                    if rolled {
+                        fnv1a(&mut hash, &format!("{:?}", game.last_roll()));
+                    }
+                }
+                fnv1a(
+                    &mut hash,
+                    &format!(
+                        "{:?} {:?} {} {} {} {:?} {:?} {:?} {:?}",
+                        game.outcome(),
+                        game.end_reason(),
+                        game.turn(),
+                        game.lp(P1),
+                        game.lp(P2),
+                        game.runes(P1),
+                        game.runes(P2),
+                        game.units(),
+                        game.board(),
+                    ),
+                );
+                for line in game.log() {
+                    fnv1a(&mut hash, line);
+                }
+            }
+            results.push(format!("{factions:?} {random:?} {hash:016x}"));
+        }
+    }
+    let expected = [
+        "[\"Ember\", \"Frost\"] [false, false] fe19ff74c4cec7db",
+        "[\"Ember\", \"Frost\"] [true, false] 29a14a958a1634dd",
+        "[\"Ember\", \"Frost\"] [false, true] 65b8fb3412a2051e",
+        "[\"Ember\", \"Frost\"] [true, true] 884f9da22c790fa8",
+        "[\"Frost\", \"Ember\"] [false, false] 6590605e0fa6e030",
+        "[\"Frost\", \"Ember\"] [true, false] 89f5ca99bec74173",
+        "[\"Frost\", \"Ember\"] [false, true] e7afefe358f1baad",
+        "[\"Frost\", \"Ember\"] [true, true] 167d9fa330bed5ed",
+        "[\"Ember\", \"Ember\"] [false, false] 41d2680950e48792",
+        "[\"Ember\", \"Ember\"] [true, false] 7355861076eff5a2",
+        "[\"Ember\", \"Ember\"] [false, true] 214849077c298cfe",
+        "[\"Ember\", \"Ember\"] [true, true] cd63300eae0f5c6b",
+        "[\"Frost\", \"Frost\"] [false, false] 6b098e6a81fa7688",
+        "[\"Frost\", \"Frost\"] [true, false] 3e24079361a9d7c9",
+        "[\"Frost\", \"Frost\"] [false, true] 3b20f3f3836535a2",
+        "[\"Frost\", \"Frost\"] [true, true] 05b02c216e85cab7",
+    ];
+    assert_eq!(results, expected, "\n{}", results.join("\n"));
+}
+
+#[test]
+fn custom_ruleset_changes_board_dice_and_rosters() {
+    let mut rules = Ruleset::basic();
+    rules.width = 9;
+    rules.height = 6;
+    rules.lp = 2;
+    rules.turn_limit = 40;
+    rules.dice_per_roll = 2;
+    rules.dice.truncate(3);
+    rules.dice[2].copies = 1;
+    rules.factions[0].monsters.truncate(2);
+    let extra = rules.factions[1].monsters[0];
+    rules.factions[1].monsters.push(Monster {
+        name: "Second Sprite",
+        ..extra
+    });
+    let rules = Arc::new(rules);
+
+    let mut game = Game::new(rules.clone(), [0, 1], 3);
+    assert_eq!((game.domain(P1), game.domain(P2)), ((0, 3), (8, 3)));
+    assert_eq!(game.cell((8, 3)), Some(Cell::Domain(P2)));
+    assert_eq!(game.lp(P2), 2);
+    assert_eq!(
+        game.roster(P1).map(|(id, _)| id).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(
+        game.roster(P2).map(|(id, _)| id).collect::<Vec<_>>(),
+        [2, 3, 4, 5]
+    );
+    assert_eq!(game.monster(5).unwrap().1.name, "Second Sprite");
+    assert!(game.monster(6).is_none());
+
+    // 2 個振り・Lv3 は在庫 1 個なので [3, 3] は不可
+    let rolls = game.legal_actions();
+    assert_eq!(rolls.len(), 8);
+    assert!(!rolls.contains(&Action::Roll { dice: vec![3, 3] }));
+    for dice in [vec![1, 1, 1], vec![3, 3], vec![4, 1]] {
+        assert_rejected(&mut game, Action::Roll { dice }, RuleError::InvalidDice);
+    }
+
+    // 同レベルが 2 体いれば先頭から召喚する
+    game.turn_player = P2;
+    game.summon(1, (1, 0));
+    assert_eq!(game.summonable(P2, 1), Some(5));
+    game.summon(1, (2, 0));
+    assert_eq!(game.summonable(P2, 1), None);
+    assert!(game.is_summoned(2) && game.is_summoned(5));
+
+    for seed in 0..8 {
+        let mut game = Game::new(rules.clone(), [1, 0], seed);
+        let mut rng = fastrand::Rng::with_seed(seed);
+        while let Some(actor) = game.to_act() {
+            let action = if actor == P1 {
+                ai::choose(&game)
+            } else {
+                ai::choose_random(&game, &mut rng)
+            };
+            assert_eq!(game.apply(action.clone()), Ok(()), "seed={seed} {action:?}");
+        }
+        assert!(game.turn() <= 40);
+    }
 }

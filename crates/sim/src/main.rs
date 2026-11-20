@@ -3,9 +3,9 @@
 #[cfg(target_arch = "wasm32")]
 compile_error!("delvers-sim はネイティブ専用です");
 
-use std::{env, ops::Range, process::ExitCode};
+use std::{env, ops::Range, process::ExitCode, sync::Arc};
 
-use delvers_core::{Action, EndReason, Face, Faction, Game, Outcome, Player, ai};
+use delvers_core::{Action, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
 
 const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random> <greedy|random> [ember-frost|frost-ember|ember-ember|frost-frost]";
 
@@ -61,8 +61,8 @@ struct Stats {
 }
 
 impl Stats {
-    fn play(&mut self, seed: u64, policies: [Policy; 2], factions: [Faction; 2]) {
-        let mut game = Game::with_factions(seed, factions);
+    fn play(&mut self, rules: &Arc<Ruleset>, seed: u64, policies: [Policy; 2], seats: [usize; 2]) {
+        let mut game = Game::new(rules.clone(), seats, seed);
         game.set_logging(false);
         // 方策の抽選がダイスの乱数列を消費しないよう分ける。
         let mut rng = fastrand::Rng::with_seed(!seed);
@@ -75,16 +75,18 @@ impl Stats {
                 Policy::Greedy => ai::choose(&game),
                 Policy::Random => ai::choose_random(&game, &mut rng),
             };
-            if let Action::Roll { dice } = action
+            if let Action::Roll { dice } = &action
                 && matches!(policies[seat], Policy::Greedy)
             {
-                let expected = (1..=3)
-                    .find(|&lv| !game.has_summoned(actor, lv))
+                let expected = game
+                    .unsummoned(actor)
+                    .map(|(_, monster)| monster.level)
+                    .min()
                     .unwrap_or(2);
                 self.greedy_rolls += 1;
-                self.greedy_roll_exceptions += u64::from(dice != [expected; 3]);
+                self.greedy_roll_exceptions += u64::from(dice.iter().any(|&lv| lv != expected));
             }
-            game.apply(action)
+            game.apply(action.clone())
                 .unwrap_or_else(|e| panic!("seed={seed} turn={} {action:?}: {e}", game.turn()));
             match action {
                 Action::Place { .. } => {
@@ -196,18 +198,20 @@ fn run() -> Result<(), String> {
     }
     let range = seeds(&args[0])?;
     let policies = [policy(&args[1])?, policy(&args[2])?];
-    use Faction::{Ember, Frost};
-    let factions = match args.get(3).map(String::as_str).unwrap_or("ember-frost") {
-        "ember-frost" => [Ember, Frost],
-        "frost-ember" => [Frost, Ember],
-        "ember-ember" => [Ember, Ember],
-        "frost-frost" => [Frost, Frost],
-        other => return Err(format!("未知の陣営設定: {other}")),
-    };
-    println!("シード {range:?}　方策 {policies:?}　陣営 {factions:?}");
+    let rules = Arc::new(Ruleset::basic());
+    let pairing = args.get(3).map(String::as_str).unwrap_or("ember-frost");
+    let seats = pairing
+        .split_once('-')
+        .and_then(|(a, b)| Some([rules.faction_index(a)?, rules.faction_index(b)?]))
+        .ok_or_else(|| format!("未知の陣営設定: {pairing}"))?;
+    let names = seats.map(|seat| rules.factions[seat].name);
+    println!(
+        "シード {range:?}　方策 {policies:?}　陣営 [{}]",
+        names.join(", ")
+    );
     let mut stats = Stats::default();
     for seed in range {
-        stats.play(seed, policies, factions);
+        stats.play(&rules, seed, policies, seats);
     }
     stats.report();
     Ok(())

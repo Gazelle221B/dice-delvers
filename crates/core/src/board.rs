@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{Ability, Cell, Game, H, Phase, Placement, Player, Pos, RuleError, UnitId, W};
+use crate::{Ability, Cell, Game, Phase, Placement, Player, Pos, RuleError, UnitId};
 
 /// 立方体の展開図 11 種。各形の添字 0 が召喚マス。
 pub const SHAPES: [[Pos; 6]; 11] = [
@@ -45,18 +45,20 @@ pub fn placement_cells(shape: u8, rot: u8, flip: bool, origin: Pos) -> Option<([
     Some((cells, cells[0]))
 }
 
-pub(super) fn neighbors((x, y): Pos) -> impl Iterator<Item = Pos> {
-    [
-        x.checked_sub(1).map(|x| (x, y)),
-        (x + 1 < W).then_some((x + 1, y)),
-        y.checked_sub(1).map(|y| (x, y)),
-        (y + 1 < H).then_some((x, y + 1)),
-    ]
-    .into_iter()
-    .flatten()
-}
-
 impl Game {
+    /// 盤内の上下左右の隣接マスを左・右・上・下の順に返す。
+    pub(crate) fn neighbors(&self, (x, y): Pos) -> impl Iterator<Item = Pos> + use<> {
+        let (w, h) = (self.rules.width, self.rules.height);
+        [
+            x.checked_sub(1).map(|x| (x, y)),
+            (x + 1 < w).then_some((x + 1, y)),
+            y.checked_sub(1).map(|y| (x, y)),
+            (y + 1 < h).then_some((x, y + 1)),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     /// 召喚配置フェーズで選べる候補を返す。
     pub fn legal_placements(&self) -> Vec<Placement> {
         if matches!(self.phase, Phase::Place { .. }) {
@@ -74,7 +76,7 @@ impl Game {
     }
 
     fn placement_contact(&self, player: Player) -> Cell {
-        if self.summoned[player.index()] == 0 {
+        if self.roster(player).all(|(id, _)| !self.is_summoned(id)) {
             Cell::Domain(player)
         } else {
             Cell::Tile(player)
@@ -85,19 +87,20 @@ impl Game {
         cells.iter().all(|&pos| self.cell(pos) == Some(Cell::Empty))
             && cells
                 .iter()
-                .any(|&pos| neighbors(pos).any(|p| self.cell(p) == Some(contact)))
+                .any(|&pos| self.neighbors(pos).any(|p| self.cell(p) == Some(contact)))
     }
 
     pub(super) fn placements(&self, player: Player) -> impl Iterator<Item = Placement> + '_ {
         let contact = self.placement_contact(player);
+        let (w, h) = (self.rules.width, self.rules.height);
         (0..SHAPES.len() as u8).flat_map(move |shape| {
             (0..4).flat_map(move |rot| {
                 [false, true].into_iter().flat_map(move |flip| {
                     let (offsets, _) = placement_cells(shape, rot, flip, (0, 0)).unwrap();
                     let right = offsets.iter().map(|p| p.0).max().unwrap();
                     let bottom = offsets.iter().map(|p| p.1).max().unwrap();
-                    (0..H - bottom).flat_map(move |y| {
-                        (0..W - right).filter_map(move |x| {
+                    (0..h.saturating_sub(bottom)).flat_map(move |y| {
+                        (0..w.saturating_sub(right)).filter_map(move |x| {
                             let cells = offsets.map(|(dx, dy)| (x + dx, y + dy));
                             self.allows_placement(&cells, contact).then_some(Placement {
                                 shape,
@@ -135,8 +138,8 @@ impl Game {
         }
         let budget = self.runes(unit.owner).movement;
         let (x, y) = unit.pos;
-        let mut seen = [[false; W]; H];
-        seen[y][x] = true;
+        let mut seen = vec![false; self.rules.width * self.rules.height];
+        seen[y * self.rules.width + x] = true;
         let mut queue = VecDeque::from([(unit.pos, 0u8)]);
         let mut reachable = Vec::new();
         while let Some((pos, steps)) = queue.pop_front() {
@@ -151,11 +154,12 @@ impl Game {
             if cost > budget {
                 continue;
             }
-            for (x, y) in neighbors(pos) {
-                if seen[y][x] || !matches!(self.board[y][x], Cell::Tile(_)) {
+            for (x, y) in self.neighbors(pos) {
+                let index = y * self.rules.width + x;
+                if seen[index] || !matches!(self.board[y][x], Cell::Tile(_)) {
                     continue;
                 }
-                seen[y][x] = true;
+                seen[index] = true;
                 let occupant = self.unit_at((x, y));
                 if occupant.is_some_and(|other| other.owner != unit.owner)
                     && unit.ability != Ability::Tunnel
@@ -175,15 +179,17 @@ impl Game {
 impl Game {
     /// 両ドメイン間に上下左右のタイル経路があるか。所有者と占有ユニットは問わない。
     pub fn domains_connected(&self) -> bool {
-        let mut stack = vec![Player::P1.domain()];
-        let mut seen = [[false; W]; H];
+        let goal = self.domain(Player::P2);
+        let mut stack = vec![self.domain(Player::P1)];
+        let mut seen = vec![false; self.rules.width * self.rules.height];
         while let Some(pos) = stack.pop() {
-            for (x, y) in neighbors(pos) {
-                if (x, y) == Player::P2.domain() {
+            for (x, y) in self.neighbors(pos) {
+                if (x, y) == goal {
                     return true;
                 }
-                if !seen[y][x] && matches!(self.board[y][x], Cell::Tile(_)) {
-                    seen[y][x] = true;
+                let index = y * self.rules.width + x;
+                if !seen[index] && matches!(self.board[y][x], Cell::Tile(_)) {
+                    seen[index] = true;
                     stack.push((x, y));
                 }
             }
