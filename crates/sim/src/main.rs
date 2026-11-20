@@ -7,16 +7,18 @@ use std::{collections::BTreeMap, env, ops::Range, process::ExitCode, sync::Arc};
 
 use delvers_core::{Action, Combatant, EndReason, Face, Game, Outcome, Player, Ruleset, ai};
 
-const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random> <greedy|random> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool]";
+const USAGE: &str = "delvers-sim <開始..終了 または 開始+試合数> <greedy|random|tactical> <greedy|random|tactical> [ember-frost|frost-ember|ember-ember|frost-frost] [basic|pool]";
 
 #[derive(Debug, Clone, Copy)]
 enum Policy {
+    Tactical,
     Greedy,
     Random,
 }
 
 fn policy(s: &str) -> Result<Policy, String> {
     match s {
+        "tactical" => Ok(Policy::Tactical),
         "greedy" => Ok(Policy::Greedy),
         "random" => Ok(Policy::Random),
         _ => Err(format!("未知の方策: {s}")),
@@ -114,6 +116,7 @@ impl Stats {
         while let Some(actor) = game.to_act() {
             let seat = actor.index();
             let action = match policies[seat] {
+                Policy::Tactical => ai::tactical(&game, &mut rng),
                 Policy::Greedy => ai::choose(&game),
                 Policy::Random => ai::choose_random(&game, &mut rng),
             };

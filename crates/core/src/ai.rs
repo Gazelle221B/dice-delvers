@@ -253,3 +253,167 @@ fn pool_roll(game: &Game) -> Action {
     dice.sort_unstable();
     Action::RollPool { dice }
 }
+
+/// 貪欲手と少数の目的別候補を共通乱数で指し継ぐ。実ダイスの乱数は読まない。
+pub fn tactical(game: &Game, rng: &mut fastrand::Rng) -> Action {
+    let player = game.turn_player();
+    let enemy = game.domain(player.opponent());
+    let home = game.domain(player);
+    let mut candidates = vec![choose(game)];
+    match game.phase() {
+        Phase::Roll if game.rules().personal_pool => {
+            for level in 1..=3 {
+                let mut pool: Vec<_> = game.unsummoned(player).collect();
+                pool.sort_by_key(|&(id, m)| {
+                    (
+                        m.level != level,
+                        m.level != 2,
+                        !matches!(m.ability, Ability::Swift | Ability::Flying),
+                        id,
+                    )
+                });
+                let mut dice: Vec<_> = pool
+                    .iter()
+                    .take(game.pool_roll_size())
+                    .map(|(id, _)| *id)
+                    .collect();
+                dice.sort_unstable();
+                candidates.push(Action::RollPool { dice });
+            }
+        }
+        Phase::ChooseSummon => candidates.extend(game.legal_actions()),
+        Phase::Action => {
+            let mut advance = None;
+            let mut intercept = None;
+            let danger = game
+                .units()
+                .iter()
+                .filter(|u| u.owner != player)
+                .min_by_key(|u| distance(u.pos, home))
+                .map(|u| u.pos);
+            for action in game.legal_actions() {
+                if let Action::Move { unit, to } = action {
+                    let u = game.unit(unit).unwrap();
+                    if distance(to, enemy) < distance(u.pos, enemy) {
+                        let rank = (distance(to, enemy), u.attacked, std::cmp::Reverse(u.hp));
+                        if advance.as_ref().is_none_or(|(best, _)| rank < *best) {
+                            advance = Some((rank, action.clone()));
+                        }
+                    }
+                    if let Some(threat) = danger
+                        && distance(home, threat) <= 4
+                        && distance(to, threat) < distance(u.pos, threat)
+                    {
+                        let rank = (distance(to, threat), u.attacked, std::cmp::Reverse(u.atk));
+                        if intercept.as_ref().is_none_or(|(best, _)| rank < *best) {
+                            intercept = Some((rank, action));
+                        }
+                    }
+                } else if matches!(action, Action::Attack { .. } | Action::TwinStrike { .. }) {
+                    candidates.push(action);
+                }
+            }
+            candidates.extend(advance.map(|(_, a)| a));
+            candidates.extend(intercept.map(|(_, a)| a));
+            candidates.push(Action::EndTurn);
+        }
+        Phase::Place { .. } => candidates.extend(placement_alternatives(game)),
+        _ => return candidates.remove(0),
+    }
+    let mut unique = Vec::new();
+    for a in candidates {
+        if !unique.contains(&a) {
+            unique.push(a);
+        }
+    }
+    if unique.len() == 1 {
+        return unique.pop().unwrap();
+    }
+    let seeds: [u64; 6] = std::array::from_fn(|_| rng.u64(..));
+    let mut winner = unique[0].clone();
+    let mut value = i32::MIN;
+    for action in unique {
+        let score = seeds
+            .iter()
+            .map(|&seed| {
+                let mut sim = game.clone();
+                sim.set_logging(false);
+                sim.rng = fastrand::Rng::with_seed(seed);
+                sim.apply(action.clone()).unwrap();
+                while sim.outcome().is_none() && sim.turn() - game.turn() < 8 {
+                    sim.apply(choose(&sim)).unwrap();
+                }
+                position_score(&sim, player) - position_score(&sim, player.opponent())
+            })
+            .sum();
+        if score > value {
+            winner = action;
+            value = score;
+        }
+    }
+    winner
+}
+
+fn placement_alternatives(game: &Game) -> Vec<Action> {
+    let player = game.turn_player();
+    let enemy = game.domain(player.opponent());
+    let home = game.domain(player);
+    let mut best = [None; 6];
+    for p in game.legal_placements() {
+        let (cells, spawn) = p.cells().unwrap();
+        let front = cells.iter().map(|&pos| distance(pos, enemy)).min().unwrap() as i32;
+        let d = distance(spawn, enemy) as i32;
+        let cover = cells
+            .iter()
+            .filter(|&&pos| distance(pos, home) == 1)
+            .count() as i32;
+        let flank = spawn.1.abs_diff(enemy.1) as i32;
+        let contact = game
+            .units()
+            .iter()
+            .filter(|u| u.owner != player)
+            .map(|u| distance(u.pos, spawn))
+            .min()
+            .unwrap_or(0) as i32;
+        let scores = [
+            100 * front + d,
+            100 * d + front,
+            5 * front + d - 10 * flank,
+            5 * front + d - 8 * cover,
+            3 * d + front - 4 * contact,
+            3 * d + front + 4 * contact,
+        ];
+        for (slot, score) in best.iter_mut().zip(scores) {
+            if slot.is_none_or(|(s, _)| score < s) {
+                *slot = Some((score, p));
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    for (_, p) in best.into_iter().flatten() {
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    candidates.into_iter().map(Action::from).collect()
+}
+
+fn position_score(game: &Game, p: Player) -> i32 {
+    let won = game.outcome() == Some(crate::Outcome::Win(p));
+    let enemy = game.domain(p.opponent());
+    let units = game.units().iter().filter(|u| u.owner == p);
+    let pressure = units
+        .clone()
+        .map(|u| 20 - distance(u.pos, enemy) as i32)
+        .max()
+        .unwrap_or(0);
+    let threats = units
+        .clone()
+        .filter(|u| distance(u.pos, enemy) == 1)
+        .count() as i32;
+    i32::from(won) * 10000
+        + i32::from(game.lp(p)) * 150
+        + pressure * 3
+        + threats * 45
+        + units.map(|u| 10 + i32::from(u.hp) / 5).sum::<i32>()
+}
