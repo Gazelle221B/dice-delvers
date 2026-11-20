@@ -1108,3 +1108,19 @@ fn pool_cpu_changes_dice_when_a_needed_rune_is_full() {
         );
     }
 }
+
+#[test]
+fn pool_legal_actions_apply_throughout_a_game() {
+    let mut game = Game::new(Arc::new(Ruleset::pool()), [1, 0], 5);
+    game.set_logging(false);
+    while game.to_act().is_some() {
+        let actions = game.legal_actions();
+        let choice = ai::choose(&game);
+        assert!(actions.contains(&choice));
+        for action in actions {
+            assert_eq!(game.clone().apply(action), Ok(()));
+        }
+        game.apply(choice).unwrap();
+    }
+    assert!(game.legal_actions().is_empty());
+}
