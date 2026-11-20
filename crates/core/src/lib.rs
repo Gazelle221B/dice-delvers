@@ -4,6 +4,7 @@
 
 pub mod ai;
 mod board;
+mod pool;
 mod rules;
 #[cfg(test)]
 mod tests;
@@ -147,6 +148,7 @@ pub enum EndReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Roll,
+    ChooseSummon,
     Place {
         level: u8,
     },
@@ -178,6 +180,13 @@ impl Placement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// プール内の別々のダイスを ID 昇順で指定する。
+    RollPool {
+        dice: Vec<UnitId>,
+    },
+    ChooseSummon {
+        die: UnitId,
+    },
     /// 振るダイスのレベルを Ruleset::dice_per_roll 個並べる。
     Roll {
         dice: Vec<u8>,
@@ -264,6 +273,7 @@ pub struct Game {
     last_roll: Option<Vec<DieRoll>>,
     log: Vec<String>,
     logging: bool,
+    summon_dice: Vec<UnitId>,
     end_reason: Option<EndReason>,
 }
 
@@ -274,18 +284,29 @@ impl Game {
         assert!(
             rules.dice_per_roll >= 1
                 && rules.dice.len() <= usize::from(u8::MAX)
-                && rules
-                    .dice
-                    .iter()
-                    .map(|die| usize::from(die.copies))
-                    .sum::<usize>()
-                    >= rules.dice_per_roll,
+                && (rules.personal_pool
+                    || rules
+                        .dice
+                        .iter()
+                        .map(|die| usize::from(die.copies))
+                        .sum::<usize>()
+                        >= rules.dice_per_roll),
             "1 手番に振る個数のダイスが置き場に無い"
         );
         assert!(
             seats.iter().all(|&seat| seat < rules.factions.len()),
             "陣営の添字が範囲外"
         );
+        if rules.personal_pool {
+            assert!(
+                rules
+                    .factions
+                    .iter()
+                    .flat_map(|f| &f.monsters)
+                    .all(|m| m.level > 0 && usize::from(m.level) <= rules.dice.len()),
+                "プールに未定義レベルのダイスがある"
+            );
+        }
         let mut board = vec![vec![Cell::Empty; rules.width]; rules.height];
         let units = seats
             .iter()
@@ -306,6 +327,7 @@ impl Game {
             last_roll: None,
             log: Vec::new(),
             logging: true,
+            summon_dice: Vec::new(),
             end_reason: None,
             rules,
         };
@@ -471,6 +493,19 @@ impl Game {
     pub fn legal_actions(&self) -> Vec<Action> {
         let mut actions = Vec::new();
         match self.phase {
+            Phase::Roll if self.rules.personal_pool => {
+                let ids: Vec<_> = self
+                    .unsummoned(self.turn_player)
+                    .map(|(id, _)| id)
+                    .collect();
+                let count = ids.len().min(self.rules.dice_per_roll);
+                pool::combinations(&ids, count, &mut Vec::new(), &mut actions);
+            }
+            Phase::ChooseSummon => actions.extend(
+                self.summon_dice
+                    .iter()
+                    .map(|&die| Action::ChooseSummon { die }),
+            ),
             Phase::Roll => {
                 // 先頭のダイスを最上位の桁とする辞書順に全組み合わせを数え上げる。
                 let levels = self.rules.dice.len() as u8;
@@ -533,7 +568,17 @@ impl Game {
     /// 合法手を適用する。Err の場合は乱数状態も含めて変更しない。
     pub fn apply(&mut self, action: Action) -> Result<(), RuleError> {
         match (self.phase, action) {
-            (Phase::Roll, Action::Roll { dice }) => self.roll(dice),
+            (Phase::Roll, Action::Roll { dice }) if !self.rules.personal_pool => {
+                if !self.valid_dice(&dice) {
+                    return Err(RuleError::InvalidDice);
+                }
+                self.roll(dice, &[]);
+                Ok(())
+            }
+            (Phase::Roll, Action::RollPool { dice }) if self.rules.personal_pool => {
+                self.roll_pool(dice)
+            }
+            (Phase::ChooseSummon, Action::ChooseSummon { die }) => self.choose_summon(die),
             (
                 Phase::Place { level },
                 Action::Place {
@@ -591,10 +636,7 @@ impl Game {
             })
     }
 
-    fn roll(&mut self, dice: Vec<u8>) -> Result<(), RuleError> {
-        if !self.valid_dice(&dice) {
-            return Err(RuleError::InvalidDice);
-        }
+    fn roll(&mut self, dice: Vec<u8>, ids: &[UnitId]) {
         let rolls: Vec<_> = dice
             .into_iter()
             .map(|level| {
@@ -617,12 +659,37 @@ impl Game {
                 }
             }
         }
+        if self.rules.personal_pool {
+            self.summon_dice = ids
+                .iter()
+                .zip(&rolls)
+                .filter_map(|(&id, r)| {
+                    (r.face == Face::Summon(r.level)
+                        && rolls
+                            .iter()
+                            .filter(|other| other.level == r.level && other.face == r.face)
+                            .count()
+                            >= 2)
+                        .then_some(id)
+                })
+                .collect();
+        }
         self.last_roll = Some(rolls);
         if self.logging {
             self.log
                 .push(format!("{} がダイスを振った", self.player_name(player)));
         }
 
+        if self.rules.personal_pool {
+            self.phase = if !self.summon_dice.is_empty() && self.placements(player).next().is_some()
+            {
+                Phase::ChooseSummon
+            } else {
+                self.summon_dice.clear();
+                Phase::Action
+            };
+            return;
+        }
         // 同レベルの召喚面が 2 個以上出たレベルのうち、召喚できる最も低いレベル。
         summons.sort_unstable();
         self.phase = summons
@@ -632,14 +699,13 @@ impl Game {
             .find(|&level| self.summonable(player, level).is_some())
             .filter(|_| self.placements(player).next().is_some())
             .map_or(Phase::Action, |level| Phase::Place { level });
-        Ok(())
     }
 
     /// 手番側のそのレベルの未召喚モンスターを pos に出す。呼び出し側で召喚可能を確かめる。
     fn summon(&mut self, level: u8, pos: Pos) {
         let owner = self.turn_player;
         let id = self
-            .summonable(owner, level)
+            .placing_monster(level)
             .expect("召喚できるモンスターがいる");
         let &Monster {
             name,
@@ -649,6 +715,7 @@ impl Game {
             def,
             ability,
         } = self.monster(id).unwrap().1;
+        self.summon_dice.clear();
         self.summoned[id] = true;
         self.units.push(Unit {
             id,
@@ -930,19 +997,28 @@ impl Game {
     fn check_stalemate(&mut self) {
         if self.units.is_empty()
             && [Player::P1, Player::P2].into_iter().all(|player| {
-                self.unsummoned(player).next().is_none() || self.placements(player).next().is_none()
+                let exhausted = if self.rules.personal_pool {
+                    !self.can_roll_pair(player)
+                } else {
+                    self.unsummoned(player).next().is_none()
+                };
+                exhausted || self.placements(player).next().is_none()
             })
         {
             self.finish_by_score(EndReason::Stalemate);
         }
     }
 
-    fn score(&self, player: Player) -> (u8, usize, u32) {
+    fn score(&self, player: Player) -> (u8, usize, usize) {
         let summoned = || self.roster(player).filter(|&(id, _)| self.summoned[id]);
         (
             self.lp(player),
             summoned().count(),
-            summoned().map(|(_, m)| u32::from(m.level)).sum(),
+            if self.rules.personal_pool {
+                self.units.iter().filter(|u| u.owner == player).count()
+            } else {
+                summoned().map(|(_, m)| usize::from(m.level)).sum()
+            },
         )
     }
 

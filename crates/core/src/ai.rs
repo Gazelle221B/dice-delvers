@@ -7,6 +7,18 @@ pub fn choose(game: &Game) -> Action {
     let player = game.turn_player();
     let enemy_domain = game.domain(player.opponent());
     match game.phase() {
+        Phase::Roll if game.rules().personal_pool => pool_roll(game),
+        Phase::ChooseSummon => game
+            .legal_actions()
+            .into_iter()
+            .max_by_key(|action| {
+                let Action::ChooseSummon { die } = action else {
+                    unreachable!()
+                };
+                let m = game.monster(*die).unwrap().1;
+                (m.atk, m.hp, std::cmp::Reverse(*die))
+            })
+            .expect("召喚候補がある"),
         Phase::Roll => {
             // 未召喚の最低レベルを揃えて狙う。配置できなければ攻撃ルーンの出る Lv2。
             let level = game
@@ -157,4 +169,30 @@ fn distance(a: Pos, b: Pos) -> usize {
 pub fn choose_random(game: &Game, rng: &mut fastrand::Rng) -> Action {
     let mut actions = game.legal_actions();
     actions.swap_remove(rng.usize(..actions.len()))
+}
+
+/// 配置できる間は揃えやすい低レベルを優先し、余った枠は攻撃・移動を得やすい Lv2 に回す。
+fn pool_roll(game: &Game) -> Action {
+    let player = game.turn_player();
+    let mut available: Vec<_> = game
+        .unsummoned(player)
+        .map(|(id, m)| (id, m.level))
+        .collect();
+    let target = if game.can_roll_pair(player) && game.placements(player).next().is_some() {
+        available
+            .iter()
+            .map(|&(_, level)| level)
+            .filter(|&level| available.iter().filter(|&&(_, lv)| lv == level).count() >= 2)
+            .min()
+    } else {
+        None
+    };
+    available.sort_by_key(|&(id, level)| (Some(level) != target, level != 2, id));
+    let mut dice: Vec<_> = available
+        .into_iter()
+        .take(game.rules().dice_per_roll)
+        .map(|(id, _)| id)
+        .collect();
+    dice.sort_unstable();
+    Action::RollPool { dice }
 }

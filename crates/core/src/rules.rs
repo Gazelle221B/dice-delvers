@@ -17,7 +17,7 @@ pub struct Monster {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Faction {
     pub name: &'static str,
-    /// 各モンスターは対局中に 1 回だけ召喚できる。同レベルが複数あれば先頭から使う。
+    /// 各モンスターは対局中に 1 回だけ召喚できる。個別プールではこの一覧の各要素が 1 個のダイスを表す。
     pub monsters: Vec<Monster>,
 }
 
@@ -31,6 +31,8 @@ pub struct Die {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
+    /// 各席の未召喚モンスターに対応する個別ダイスを使う。
+    pub personal_pool: bool,
     pub name: &'static str,
     /// 盤面の列数。ドメインは (0, height / 2) と (width - 1, height / 2)。
     pub width: usize,
@@ -69,6 +71,7 @@ impl Ruleset {
         let die = |faces| Die { faces, copies: 3 };
         Self {
             name: "basic",
+            personal_pool: false,
             width: 13,
             height: 11,
             lp: 3,
@@ -129,6 +132,68 @@ impl Ruleset {
                 },
             ],
         }
+    }
+
+    /// 各席がモンスターと対になった 15 個のダイスを持つ。
+    pub fn pool() -> Self {
+        let mut rules = Self::basic();
+        rules.name = "pool";
+        rules.personal_pool = true;
+        let names = [
+            [
+                "Sootstitch",
+                "Charbrindle",
+                "Wickpatter",
+                "Ashnib",
+                "Kilnwhisk",
+                "Cinderwicker",
+                "Coalspindle",
+                "Scorchloom",
+                "Umberlatch",
+                "Flintspool",
+                "Sinterdrum",
+                "Pyreweft",
+                "Hearthtread",
+                "Calderabell",
+                "Cruciblequill",
+            ],
+            [
+                "Rimeskein",
+                "Sleetpip",
+                "Hailstitch",
+                "Hoarfleck",
+                "Brinepurl",
+                "Glazewinder",
+                "Rimebuckle",
+                "Sleetshuttle",
+                "Floefret",
+                "Coldspindle",
+                "Driftmantle",
+                "Hailchime",
+                "Glacierweft",
+                "Tundrabell",
+                "Floequill",
+            ],
+        ];
+        let levels = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4];
+        for (faction, names) in rules.factions.iter_mut().zip(names) {
+            let templates = &faction.monsters;
+            faction.monsters = names
+                .into_iter()
+                .zip(levels)
+                .enumerate()
+                .map(|(i, (name, level))| {
+                    let template = templates[usize::from(level.min(3u8) - 1)];
+                    Monster {
+                        name,
+                        level,
+                        ability: templates[i % templates.len()].ability,
+                        ..template
+                    }
+                })
+                .collect();
+        }
+        rules
     }
 
     /// 名前 (大文字小文字は区別しない) から陣営の添字を引く。
