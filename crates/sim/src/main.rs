@@ -305,3 +305,18 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod interval_tests {
+    #[test]
+    fn wilson_handles_extremes_and_balanced_samples() {
+        for (wins, lo, hi) in [
+            (0, 0., 0.001917),
+            (1000, 0.478108, 0.521892),
+            (2000, 0.998083, 1.),
+        ] {
+            let (left, right) = super::wilson(wins, 2000);
+            assert!((left - lo).abs() < 0.00001 && (right - hi).abs() < 0.00001);
+        }
+    }
+}

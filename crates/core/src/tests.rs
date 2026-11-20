@@ -746,8 +746,7 @@ fn logging_does_not_change_random_play() {
 }
 
 /// ゴールデンテスト用の対局生成。ルールエンジンの API 変更時はここだけを追従させる。
-fn golden_game(seed: u64, factions: [&str; 2]) -> Game {
-    let rules = Ruleset::basic();
+fn golden_game(rules: Ruleset, seed: u64, factions: [&str; 2]) -> Game {
     let seats = factions.map(|name| rules.faction_index(name).unwrap());
     Game::new(Arc::new(rules), seats, seed)
 }
@@ -762,8 +761,7 @@ fn fnv1a(hash: &mut u64, text: &str) {
 
 /// 固定シードで最後まで対局し、行動列・出目・ログ・終局状態のハッシュを既知値と比べる。
 /// 既知値はルールセットのデータ化前のコードで計算した。挙動を意図して変えたとき以外は更新しない。
-#[test]
-fn golden_games_match_known_hashes() {
+fn golden_hashes(preset: fn() -> Ruleset) -> Vec<String> {
     let mut results = Vec::new();
     for factions in [
         ["Ember", "Frost"],
@@ -774,7 +772,7 @@ fn golden_games_match_known_hashes() {
         for random in [[false, false], [true, false], [false, true], [true, true]] {
             let mut hash = 0xcbf2_9ce4_8422_2325;
             for seed in 0..6 {
-                let mut game = golden_game(seed, factions);
+                let mut game = golden_game(preset(), seed, factions);
                 let mut rng = fastrand::Rng::with_seed(!seed);
                 while let Some(actor) = game.to_act() {
                     let action = if random[actor.index()] {
@@ -783,7 +781,7 @@ fn golden_games_match_known_hashes() {
                         ai::choose(&game)
                     };
                     fnv1a(&mut hash, &format!("{action:?}"));
-                    let rolled = matches!(action, Action::Roll { .. });
+                    let rolled = matches!(action, Action::Roll { .. } | Action::RollPool { .. });
                     game.apply(action).unwrap();
                     if rolled {
                         fnv1a(&mut hash, &format!("{:?}", game.last_roll()));
@@ -811,6 +809,12 @@ fn golden_games_match_known_hashes() {
             results.push(format!("{factions:?} {random:?} {hash:016x}"));
         }
     }
+    results
+}
+
+#[test]
+fn golden_games_match_known_hashes() {
+    let results = golden_hashes(Ruleset::basic);
     let expected = [
         "[\"Ember\", \"Frost\"] [false, false] fe19ff74c4cec7db",
         "[\"Ember\", \"Frost\"] [true, false] 29a14a958a1634dd",
@@ -894,4 +898,200 @@ fn custom_ruleset_changes_board_dice_and_rosters() {
         }
         assert!(game.turn() <= 40);
     }
+}
+
+#[test]
+fn pool_rolls_distinct_owned_dice_and_spends_only_the_chosen_hit() {
+    let mut rules = Ruleset::pool();
+    rules.dice[0].faces = [Face::Summon(1); 6];
+    rules.dice[1].faces = [Face::Summon(2); 6];
+    let mut game = Game::new(Arc::new(rules), [0, 0], 99);
+    let actions = game.legal_actions();
+    assert_eq!(actions.len(), 455);
+    for action in actions {
+        assert_eq!(game.clone().apply(action), Ok(()));
+    }
+    for ids in [
+        vec![0, 0, 1],
+        vec![2, 1, 0],
+        vec![0, 1],
+        vec![0, 1, 15],
+        vec![0, 1, usize::MAX],
+    ] {
+        assert_rejected(
+            &mut game,
+            Action::RollPool { dice: ids },
+            RuleError::InvalidDice,
+        );
+    }
+    assert_rejected(
+        &mut game,
+        Action::Roll { dice: vec![1; 3] },
+        RuleError::WrongPhase,
+    );
+    game.apply(Action::RollPool {
+        dice: vec![1, 3, 5],
+    })
+    .unwrap();
+    assert_eq!(
+        game.legal_actions(),
+        [
+            Action::ChooseSummon { die: 1 },
+            Action::ChooseSummon { die: 3 }
+        ]
+    );
+    for die in [0, 5, 15] {
+        assert_rejected(
+            &mut game,
+            Action::ChooseSummon { die },
+            RuleError::InvalidDice,
+        );
+    }
+    game.apply(Action::ChooseSummon { die: 3 }).unwrap();
+    assert_eq!(game.unsummoned(P1).count(), 15);
+    assert_rejected(
+        &mut game,
+        placement((usize::MAX, 0)).into(),
+        RuleError::InvalidPlacement,
+    );
+    game.apply(game.legal_actions().remove(0)).unwrap();
+    assert_eq!(game.units()[0].id, 3);
+    assert_eq!(game.unsummoned(P1).count(), 14);
+    assert_eq!(game.unsummoned(P2).count(), 15);
+    game.phase = Phase::Roll;
+    assert_rejected(
+        &mut game,
+        Action::RollPool {
+            dice: vec![1, 3, 5],
+        },
+        RuleError::InvalidDice,
+    );
+}
+
+#[test]
+fn pool_short_rolls_and_stalemate_require_a_possible_pair() {
+    let mut game = Game::new(Arc::new(Ruleset::pool()), [0, 1], 5);
+    for ids in [vec![0, 5], vec![0], vec![]] {
+        game.summoned.fill(true);
+        for &id in &ids {
+            game.summoned[id] = false;
+        }
+        game.phase = Phase::Roll;
+        let action = Action::RollPool { dice: ids.clone() };
+        assert_eq!(game.legal_actions(), std::slice::from_ref(&action));
+        assert_eq!(ai::choose(&game), action);
+        game.apply(action).unwrap();
+        assert_eq!(game.last_roll().unwrap().len(), ids.len());
+        game.apply(Action::EndTurn).unwrap();
+        assert_eq!(game.end_reason(), Some(EndReason::Stalemate));
+    }
+    let mut game = Game::new(Arc::new(Ruleset::pool()), [1, 1], 5);
+    game.summoned.fill(true);
+    game.summoned[0..2].fill(false);
+    game.board[5][1] = Cell::Tile(P1);
+    game.phase = Phase::Action;
+    game.apply(Action::EndTurn).unwrap();
+    assert!(game.outcome().is_none());
+}
+
+#[test]
+fn pool_blocked_placement_returns_all_dice() {
+    let mut rules = Ruleset::pool();
+    rules.dice[0].faces = [Face::Summon(1); 6];
+    let mut game = Game::new(Arc::new(rules), [1, 1], 1);
+    for (x, y) in game.neighbors(game.domain(P1)) {
+        game.board[y][x] = Cell::Tile(P2);
+    }
+    game.apply(Action::RollPool {
+        dice: vec![0, 1, 2],
+    })
+    .unwrap();
+    assert_eq!(game.phase(), Phase::Action);
+    assert_eq!(game.unsummoned(P1).count(), 15);
+}
+
+#[test]
+fn pool_games_match_known_hashes() {
+    let results = golden_hashes(Ruleset::pool);
+    assert_eq!(
+        results,
+        [
+            "[\"Ember\", \"Frost\"] [false, false] 372621da67eb55be",
+            "[\"Ember\", \"Frost\"] [true, false] 1c885988d0568bb9",
+            "[\"Ember\", \"Frost\"] [false, true] 90248fad8ca33931",
+            "[\"Ember\", \"Frost\"] [true, true] 0f41641741fb02ca",
+            "[\"Frost\", \"Ember\"] [false, false] 40d88963bc68bd2c",
+            "[\"Frost\", \"Ember\"] [true, false] 8b8cce951c01754b",
+            "[\"Frost\", \"Ember\"] [false, true] cdf751e401c60736",
+            "[\"Frost\", \"Ember\"] [true, true] 63b49b8192d71f0a",
+            "[\"Ember\", \"Ember\"] [false, false] 237ef2322cf043db",
+            "[\"Ember\", \"Ember\"] [true, false] def0d19abe86d4cb",
+            "[\"Ember\", \"Ember\"] [false, true] fd28c5823362538a",
+            "[\"Ember\", \"Ember\"] [true, true] 18cfb35bc8379f12",
+            "[\"Frost\", \"Frost\"] [false, false] ad2598ff4486ce9f",
+            "[\"Frost\", \"Frost\"] [true, false] bb31945720f9c9f5",
+            "[\"Frost\", \"Frost\"] [false, true] fa43144f11c535cc",
+            "[\"Frost\", \"Frost\"] [true, true] 33f4ae80a3824d02",
+        ]
+    );
+}
+
+#[test]
+fn pool_multiple_pairs_offer_one_summon_and_all_actions_apply() {
+    let mut rules = Ruleset::pool();
+    rules.dice_per_roll = 4;
+    for (i, die) in rules.dice.iter_mut().enumerate() {
+        die.faces = [Face::Summon((i + 1) as u8); 6];
+    }
+    let mut g = Game::new(Arc::new(rules), [0, 1], 0);
+    g.apply(Action::RollPool {
+        dice: vec![1, 2, 5, 6],
+    })
+    .unwrap();
+    assert_eq!(
+        g.legal_actions(),
+        [1, 2, 5, 6].map(|die| Action::ChooseSummon { die })
+    );
+    for die in [1, 5] {
+        let mut branch = g.clone();
+        branch.apply(Action::ChooseSummon { die }).unwrap();
+        for placement in branch.legal_actions() {
+            let mut placed = branch.clone();
+            placed.apply(placement).unwrap();
+            assert_eq!(placed.units()[0].id, die);
+            assert_eq!(placed.unsummoned(P1).count(), 14);
+        }
+    }
+}
+
+#[test]
+fn pool_counts_tiles_then_survivors_after_lp() {
+    let mut g = Game::new(Arc::new(Ruleset::pool()), [0, 1], 0);
+    g.summoned[0] = true;
+    g.summoned[14] = true;
+    g.summoned[29] = true;
+    assert!(g.score(P1) > g.score(P2));
+    g.summoned[14] = false;
+    assert_eq!(g.score(P1), g.score(P2));
+    g.summon_dice.push(0);
+    g.summon(1, (0, 0));
+    assert!(g.score(P1) > g.score(P2));
+    g.lp[0] -= 1;
+    assert!(g.score(P1) < g.score(P2));
+}
+
+#[test]
+fn pool_legal_actions_apply_throughout_a_game() {
+    let mut game = Game::new(Arc::new(Ruleset::pool()), [1, 0], 5);
+    game.set_logging(false);
+    while game.to_act().is_some() {
+        let actions = game.legal_actions();
+        let choice = ai::choose(&game);
+        assert!(actions.contains(&choice));
+        for action in actions {
+            assert_eq!(game.clone().apply(action), Ok(()));
+        }
+        game.apply(choice).unwrap();
+    }
+    assert!(game.legal_actions().is_empty());
 }
